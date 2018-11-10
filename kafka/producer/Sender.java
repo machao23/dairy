@@ -13,12 +13,14 @@ public class Sender implements Runnable {
         log.debug("Beginning shutdown of Kafka producer I/O thread, sending remaining records.");
 	}
 
+	// 负责和Accumulator打交道，获取缓存要发送的批次（因为有了批次这个概念，才会有Accumulator这个组件）
+	// 后面的网络IO委托给NetworkClient搞定
 	void run(long now) {
 		 
 		Cluster cluster = metadata.fetch();
 		// 获取集群中符合发送消息条件的节点集合
 
-		// 从累加器里不停地轮询获取吗？
+		// 被唤醒后从累加器里捞取待发送的消息批次
         RecordAccumulator.ReadyCheckResult result = this.accumulator.ready(cluster, now);
 
 		// 标记需要更新kafka的集群信息
@@ -30,7 +32,7 @@ public class Sender implements Runnable {
         while (iter.hasNext()) {
             Node node = iter.next();
 			// 经过NetworkClient的过滤
-			// 检查网络IO方面是否符合发送消息的条件
+			// 检查网络IO方面(connection,channel...)是否符合发送消息的条件
             if (!this.client.ready(node, now)) {
                 iter.remove();
                 notReadyTimeout = Math.min(notReadyTimeout, this.client.connectionDelay(node, now));
@@ -85,18 +87,21 @@ public class Sender implements Runnable {
     }
 }
 
-// 通用的网络客户端实现，不知用于producer发送消息，也用于consumer消费消息，还有broker之间的通信
+// 通用的网络客户端实现，不仅仅用于producer发送消息，也用于consumer消费消息，还有broker之间的通信
 public class NetworkClient implements KafkaClient {
+	// 本质上网络IO都是委托给selector搞定
 	private final Selectable selector;
-	// 默认实现是内部类DefaultMetadataUpdater
+	// 默认实现是内部类DefaultMetadataUpdater, 负责更新集群元信息
 	private final MetadataUpdater metadataUpdater;
 	// 底层是Map实现 NodeId -> NodeConnectionState, 管理每个node的连接状态
 	// 主要用于检测连接状态
 	private final ClusterConnectionStates connectionStates;
-	// 缓存已经发出去但没有收到响应的ClientRequest
+	// 缓存已经发出去但没有收到响应的ClientRequest,管理在途的request
+	// 底层是Map<NodeId, Dequeue<Request>>
 	private final InFlightRequests inFlightRequests;
 
 	// 检测node是否可以接受请求
+	// 发送消息前做防御性检查筛选
 	@Override
     public boolean ready(Node node, long now) {
 		// node可以接受请求
@@ -114,9 +119,11 @@ public class NetworkClient implements KafkaClient {
     public void send(ClientRequest request, long now) {
         String nodeId = request.request().destination();
 		// 检测连接状态、身份认证、在途请求最大限制
+		// 会调用InFlightRequest.canSendMore检查，保证不会覆盖发往该node对应KafkaChannel的send字段，引发KafkaChannel.send抛异常
         if (!canSendRequest(nodeId))
 			// 检查能否填充指定node对应的KafkaChannel的send字段
             throw new IllegalStateException("Attempt to send a request to node " + nodeId + " which is not ready.");
+		// 最后调用的顺序是 NetworkClient.send -> Selector.send -> KafkaChannel.setSend
         doSend(request, now);
     }
 
@@ -337,22 +344,28 @@ public class Selector implements Selectable {
 	// jdk的selector,用来监听网络IO事件
 	private final java.nio.channels.Selector nioSelector;
 	// nodeId -> KafkaChannel
+	// 一个node对应一个channel
     private final Map<String, KafkaChannel> channels;
+
+	// 以下集合都是一次poll轮询记录，因为每次poll开始都会清空这些集合
 	// 完全发送出去的请求
     private final List<Send> completedSends;
 	// 完全接收到的请求
     private final List<NetworkReceive> completedReceives;
 	// 暂存一个OP_READ事件处理过程中读取到的全部请求,OP_READ事件处理完，请求转移到completedReceives
     private final Map<KafkaChannel, Deque<NetworkReceive>> stagedReceives;
+	private final Set<SelectionKey> immediatelyConnectedKeys; //在调用SocketChannel#connect方法时立即完成的SelectionKey
 	// poll过程中发现的断开的链接
     private final List<String> disconnected;
 	// poll过程中发现的新建的链接
     private final List<String> connected;
 	// 记录向哪些node发送请求失败了
+	// 但并不是由于IO异常导致的失败，而是由于SelectionKey被cancel引起的失败，比如对一个已关闭的channel设置interestOps
     private final List<String> failedSends;
 	// 创建KafkaChannel的builder
     private final ChannelBuilder channelBuilder;
 	// 记录各个连接的使用情况，并据此关闭空闲时间超过connectionMaxIdleNanos的链接
+	// 一个连接太久没有用来执行读写操作，为了降低服务器端的压力，需要释放这些的连接
     private final Map<String, Long> lruConnections;
 
 	// 连接kafka集群的node，创建channel
@@ -369,7 +382,9 @@ public class Selector implements Selectable {
         socket.setTcpNoDelay(true);
 		// 这里是非阻塞立即返回，需要通过finishConnect方法确认连接建立
         boolean connected = socketChannel.connect(address);
+		// 注册OP_CONNECT，后面连接完成会通知
         SelectionKey key = socketChannel.register(nioSelector, SelectionKey.OP_CONNECT);
+		// 创建一个KafkaChannel
         KafkaChannel channel = channelBuilder.buildChannel(id, key, maxReceiveSize);
         key.attach(channel);
         this.channels.put(id, channel);
@@ -384,14 +399,28 @@ public class Selector implements Selectable {
         int readyKeys = select(timeout);
 
         if (readyKeys > 0 || !immediatelyConnectedKeys.isEmpty()) {
+			// 处理已经就绪的selector key集合
             pollSelectionKeys(this.nioSelector.selectedKeys(), false);
             pollSelectionKeys(immediatelyConnectedKeys, true);
         }
 
 		// 处理完从stage移到completed
         addToCompletedReceives();
-		// 关闭长时间空闲的连接
+		// 关闭长时间空闲的连接,依据是lruConnections里记录的modified时间戳
         maybeCloseOldestConnection();
+    }
+
+	// 清空上一轮poll保存的集合
+	private void clear() {
+        this.completedSends.clear();
+        this.completedReceives.clear();
+        this.connected.clear();
+        this.disconnected.clear();
+		// 这里之所以把failedSends加到disconnected之中，是因为failedSends里保存的失败的send，并不是上次poll留下来的，
+		// 而是上次poll之后，此次poll之前，调用send方法时添加到failedSends集合中的。
+		// 当有failedSends时，selector就会关闭这个channel，因此在clear过程中，需要把failedSends里保存的节点加到disconnected之中。
+        this.disconnected.addAll(this.failedSends);
+        this.failedSends.clear();
     }
 
 	// 处理selector返回的就绪keys
@@ -401,10 +430,12 @@ public class Selector implements Selectable {
             SelectionKey key = iterator.next();
             iterator.remove();
             KafkaChannel channel = channel(key);
-			// 更新该channel的modified时间
+			// 更新该channel的modified时间,闲置时长
             lruConnections.put(channel.id(), currentTimeNanos);
 
 			if (isImmediatelyConnected || key.isConnectable()) {
+				// 在OP_CONNECT触发后，调用SocketChannel.finishConnect成功后，连接才真正建立
+				// 如果我们不调用该方法，就去调用read/write方法，则会抛出一个NotYetConnectedException异常。
 				if (channel.finishConnect()) 
 					// 确认连接建立成功
 					this.connected.add(channel.id());
@@ -416,7 +447,6 @@ public class Selector implements Selectable {
 
 			// Read就绪
 			if (channel.ready() && key.isReadable() && !hasStagedReceive(channel)) {
-				NetworkReceive networkReceive;
 				while ((networkReceive = channel.read()) != null)
 					addToStagedReceives(channel, networkReceive);
 			}
@@ -424,6 +454,7 @@ public class Selector implements Selectable {
 			// Write就绪
 			if (channel.ready() && key.isWritable()) {
 				// 将KafkaChannel的send字段发送出去
+				// 实质调用的是JDK NIO里的SocketChannel.write(byteBuffer[])
 				Send send = channel.write();
 				if (send != null) {
 					this.completedSends.add(send);
@@ -435,16 +466,21 @@ public class Selector implements Selectable {
 
 public class KafkaChannel {
 	// 根据网络协议不同，提供不同的子类
+	// 默认是PlaintextTransportLayer子类
     private final TransportLayer transportLayer;
 	// 读写缓存ByteBuffer
     private NetworkReceive receive;
+	// 正在处理待发送的请求
     private Send send;
 
 	// 消息写入send缓存
 	public void setSend(Send send) {
+		if (this.send != null)
+			// send不为空表示有请求待发送，不能覆盖抛出异常
+            throw new IllegalStateException("Attempt to begin a send operation with prior send operation still in progress.");
 		// 数据写入send字段
         this.send = send;
-		// 关注OP_WRITE
+		// 有消息待发送了，关注OP_WRITE
         this.transportLayer.addInterestOps(SelectionKey.OP_WRITE);
     }
 
@@ -473,12 +509,18 @@ public class KafkaChannel {
 }
 
 public class PlaintextTransportLayer implements TransportLayer {
+
+	// NIO网络通讯的2个组件：selectionKey和socketChannel
+	private final SelectionKey key;
+	private final SocketChannel socketChannel;
+
 	@Override
     public boolean finishConnect() throws IOException {
-		// 确认连接建立成功
+		// NIO连接建立后，必须要调用SocketChannel.finishConnect，否则读写该channel会报错
         boolean connected = socketChannel.finishConnect();
         if (connected)
 			// 建立成功后不关心OP_CONNECT，增加关心OP_READ
+			// 连接建立以后，个人感觉这个OP_READ基本不会取消关注
             key.interestOps(key.interestOps() & ~SelectionKey.OP_CONNECT | SelectionKey.OP_READ);
         return connected;
     }
