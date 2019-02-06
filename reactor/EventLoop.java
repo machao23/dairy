@@ -85,13 +85,13 @@ public abstract class AbstractEventExecutor extends AbstractExecutorService impl
 }
 
 // 在AbstractEventExecutor的基础上提供了对定时任务的支持
-// 主要是定时任务场景，因为没有需求所以先不看了
 public abstract class AbstractScheduledEventExecutor extends AbstractEventExecutor {
 	// 用来保存定时任务的队列
 	// ScheduledFutureTask继承了Netty自己的PromiseTask，同时实现了JDK定时任务接口ScheduledFuture
 	PriorityQueue<ScheduledFutureTask<?>> scheduledTaskQueue;
 
 	// 添加定时任务
+	// 即使是非定时场景，也可以添加一个马上执行的任务
 	<V> ScheduledFuture<V> schedule(final ScheduledFutureTask<V> task) {
         if (inEventLoop()) {
             scheduledTaskQueue().add(task);
@@ -106,5 +106,68 @@ public abstract class AbstractScheduledEventExecutor extends AbstractEventExecut
         }
 
         return task;
+    }
+}
+
+// 在定时执行任务AbstractScheduledEventExecutor基础上扩展
+public abstract class SingleThreadEventExecutor extends AbstractScheduledEventExecutor implements OrderedEventExecutor {
+	// 自己的可执行任务队列
+	private final Queue<Runnable> taskQueue;
+
+	// 默认队列实现是链表队列
+	protected Queue<Runnable> newTaskQueue(int maxPendingTasks) {
+        return new LinkedBlockingQueue<Runnable>(maxPendingTasks);
+    }
+
+    protected Runnable takeTask() {
+        BlockingQueue<Runnable> taskQueue = (BlockingQueue<Runnable>) this.taskQueue;
+        for (;;) {
+        	// 从scheduledTaskQueue取一个scheduledTask, 注意方法是peek, task有可能还没有到执行时间
+            ScheduledFutureTask<?> scheduledTask = peekScheduledTask();
+            if (scheduledTask == null) {
+                Runnable task = null;
+            	// 队列里没有任务，就阻塞等待
+                task = taskQueue.take();
+                if (task == WAKEUP_TASK) {
+                	// 跳过WAKEUP_TASK
+                    task = null;
+                }
+                return task;
+            } else {
+                long delayNanos = scheduledTask.delayNanos();
+                Runnable task = null;
+                if (delayNanos > 0) {
+                	// 如果定时任务还没有到时间执行，等待delayNano时间从taskQueue里获取任务
+                	// 在阻塞等待期间，如果有新的定时任务加入taskQueue就能拿到
+                    try {
+                        task = taskQueue.poll(delayNanos, TimeUnit.NANOSECONDS);
+                    } catch (InterruptedException e) {
+                        // 这种情况是因为有新的定时任务加入，且时间小于之前拿到的定时任务，需要提前结束阻塞
+                        return null;
+                    }
+                }
+                if (task == null) {
+                	// 继续尝试从定时任务队列里获取任务添加到taskQueue里
+                    fetchFromScheduledTaskQueue();
+                    // 再尝试从taskQueue里获取任务
+                    task = taskQueue.poll();
+                }
+
+                // 一直无限循环，直到获取到可以执行的任务
+                if (task != null) {
+                    return task;
+                }
+            }
+        }
+    }
+
+    // execute只是将任务加入到taskQueue里，真正的执行不再这里
+    @Override
+    public void execute(Runnable task) {
+        boolean inEventLoop = inEventLoop();
+        addTask(task);
+        if (!inEventLoop) {
+            startThread();
+        }
     }
 }

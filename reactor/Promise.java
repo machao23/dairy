@@ -46,6 +46,25 @@ public class DefaultPromise<V> extends AbstractFuture<V> implements Promise<V> {
     //异步操作结果
 	private volatile Object result;
 
+	// 监听者，可能是1个或多个，
+	// 当所有listeners被通知触发，就会清空成null
+	private Object listeners;
+
+	@Override
+    public Promise<V> addListener(GenericFutureListener<? extends Future<? super V>> listener) {
+        // 加锁后添加listener
+        synchronized (this) {
+            addListener0(listener);
+        }
+
+        // 添加完成后如果promise的状态已经完成，就立即通知listeners
+        if (isDone()) {
+            notifyListeners();
+        }
+
+        return this;
+    }
+
 	// 异步操作结束时调用
 	public Promise<V> setSuccess(V result) {
 	   if (setSuccess0(result)) {
@@ -70,5 +89,70 @@ public class DefaultPromise<V> extends AbstractFuture<V> implements Promise<V> {
             return true;
         }
         return false;
+    }
+
+    private void notifyListeners() {
+        EventExecutor executor = executor();
+        if (executor.inEventLoop()) {
+            notifyListenersNow();
+            return;
+        }
+
+        safeExecute(executor, new Runnable() {
+            @Override
+            public void run() {
+                notifyListenersNow();
+            }
+        });
+    }
+
+    private void notifyListenersNow() {
+        Object listeners;
+        synchronized (this) {
+        	// 取出listeners，将其清空null
+            notifyingListeners = true;
+            listeners = this.listeners;
+            this.listeners = null;
+        }
+        for (;;) {
+            if (listeners instanceof DefaultFutureListeners) {
+            	// 调用GenericFutureListener.operationComplete
+                notifyListeners0((DefaultFutureListeners) listeners);
+            } else {
+                notifyListener0(this, (GenericFutureListener<?>) listeners);
+            }
+            synchronized (this) {
+            	// 在执行listeners期间可能有新的listener加入，也需要通知它们然后清空null
+                if (this.listeners == null) {
+                    notifyingListeners = false;
+                    return;
+                }
+                listeners = this.listeners;
+                this.listeners = null;
+            }
+        }
+    }
+
+    // 阻塞等待
+    @Override
+    public Promise<V> await() throws InterruptedException {
+        if (isDone()) {
+            return this;
+        }
+
+        checkDeadLock();
+
+        // 线程在promise对象this上等待notify
+        synchronized (this) {
+            while (!isDone()) {
+                incWaiters();
+                try {
+                    wait();
+                } finally {
+                    decWaiters();
+                }
+            }
+        }
+        return this;
     }
 }
