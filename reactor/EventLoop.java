@@ -173,6 +173,15 @@ public abstract class SingleThreadEventExecutor extends AbstractScheduledEventEx
 }
 
 public final class NioEventLoop extends SingleThreadEventLoop {
+
+	@Override
+    public final void register(EventLoop eventLoop, final ChannelPromise promise) {
+    	// 设置 Channel 的 eventLoop 属性，建立关联关系
+        AbstractChannel.this.eventLoop = eventLoop;
+
+	    register0(promise);
+    }
+
 	@Override
     protected void run() {
 		// 事件无限循环
