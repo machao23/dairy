@@ -64,7 +64,20 @@ public class NettyClient extends AbstractClient {
 }
 
 public class Bootstrap extends AbstractBootstrap<Bootstrap, Channel> {
+
+    // 默认的地址解析器，解析服务端地址
+    private volatile AddressResolverGroup<SocketAddress> resolver =
+            (AddressResolverGroup<SocketAddress>) DEFAULT_RESOLVER;
+
+    private ChannelFuture doResolveAndConnect(final SocketAddress remoteAddress, final SocketAddress localAddress) {
+        // 初始化channel注册到eventLoop（本质是注册JDK的channel到JDK的selector上）
+        final ChannelFuture regFuture = initAndRegister();
+        final Channel channel = regFuture.channel();
+        return doResolveAndConnect0(channel, remoteAddress, localAddress, channel.newPromise());
+    }
+
     // Bootstrap.connect实质是调用doConnect
+    // doResolveAndConnect0里会被调用
     private static void doConnect(
             final SocketAddress remoteAddress, final SocketAddress localAddress, final ChannelPromise connectPromise) {
 
@@ -99,6 +112,32 @@ public class NioSocketChannel extends AbstractNioByteChannel implements io.netty
     // 构造方法，DEFAULT_SELECTOR_PROVIDER和操作系统有关，OSX上是KQueueSelectorProvider
     public NioSocketChannel() {
         this(DEFAULT_SELECTOR_PROVIDER);
+    }
+
+    @Override
+    protected boolean doConnect(SocketAddress remoteAddress, SocketAddress localAddress) throws Exception {
+        // 绑定本地地址
+        if (localAddress != null) {
+            doBind0(localAddress);
+        }
+
+        boolean success = false;
+        boolean connected = SocketUtils.connect(javaChannel(), remoteAddress);
+        if (!connected) {
+            // 若未连接完成，则关注连接( OP_CONNECT )事件。
+            selectionKey().interestOps(SelectionKey.OP_CONNECT);
+        }
+        success = true;
+        return connected;
+    }
+
+    // selector轮询到OP_CONNECT时触发
+    // 调用JDK的 SocketChannel#finishConnect() 方法，完成连接。
+    @Override
+    protected void doFinishConnect() throws Exception {
+        if (!javaChannel().finishConnect()) {
+            throw new Error();
+        }
     }
 }
 
@@ -183,9 +222,46 @@ protected abstract class AbstractNioUnsafe extends AbstractUnsafe implements Nio
 	public final void connect(
 			final SocketAddress remoteAddress, final SocketAddress localAddress, final ChannelPromise promise) {
 		// 调用java nio的connect
-		doConnect(remoteAddress, localAddress);
-		// 触发fireChannelActive事件,发送通道激活消息,Inbound事件的起点
-		fulfillConnectPromise(promise, wasActive);
+		if (doConnect(remoteAddress, localAddress)) {
+            // 触发fireChannelActive事件,发送通道激活消息,Inbound事件的起点
+            fulfillConnectPromise(promise, wasActive);
+        } else {
+            connectPromise = promise;
+            requestedRemoteAddress = remoteAddress;
+
+            // Schedule connect timeout.
+            int connectTimeoutMillis = config().getConnectTimeoutMillis();
+            if (connectTimeoutMillis > 0) {
+                 // 使用 EventLoop 发起定时任务，监听连接远程地址超时。若连接超时，则回调通知 connectPromise 超时异常。
+                connectTimeoutFuture = eventLoop().schedule(new Runnable() {
+                    @Override
+                    public void run() {
+                        ChannelPromise connectPromise = AbstractNioChannel.this.connectPromise;
+                        ConnectTimeoutException cause =
+                                new ConnectTimeoutException("connection timed out: " + remoteAddress);
+                        if (connectPromise != null && connectPromise.tryFailure(cause)) {
+                            close(voidPromise());
+                        }
+                    }
+                }, connectTimeoutMillis, TimeUnit.MILLISECONDS);
+            }
+
+            // 添加监听器，监听连接远程地址取消。
+            promise.addListener(new ChannelFutureListener() {
+                @Override
+                public void operationComplete(ChannelFuture future) throws Exception {
+                    if (future.isCancelled()) {
+                        // 取消定时任务
+                        if (connectTimeoutFuture != null) {
+                            connectTimeoutFuture.cancel(false);
+                        }
+                        // 置空 connectPromise
+                        connectPromise = null;
+                        close(voidPromise());
+                    }
+                }
+            });
+        }	
 	}
 }
 
