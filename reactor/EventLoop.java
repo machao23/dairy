@@ -114,9 +114,49 @@ public abstract class SingleThreadEventExecutor extends AbstractScheduledEventEx
 	// 自己的可执行任务队列
 	private final Queue<Runnable> taskQueue;
 
+	// 添加任务后，任务是否会自动导致线程唤醒
+	private final boolean addTaskWakesUp;
+
+
 	// 默认队列实现是链表队列
 	protected Queue<Runnable> newTaskQueue(int maxPendingTasks) {
         return new LinkedBlockingQueue<Runnable>(maxPendingTasks);
+    }
+
+    // NioEventLoop执行任务时被调用
+    protected boolean runAllTasks() {
+        boolean fetchedAll;
+        boolean ranAtLeastOne = false;
+
+        do {
+        	// 拉取已到执行时间的定时任务，转到taskQueue
+            fetchedAll = fetchFromScheduledTaskQueue();
+            // 执行任务
+            if (runAllTasksFrom(taskQueue)) {
+                ranAtLeastOne = true;
+            }
+        } while (!fetchedAll); // keep on processing until we fetched all scheduled tasks.
+
+        // 执行完的处理
+        afterRunningAllTasks();
+        return ranAtLeastOne;
+    }
+
+    // 遍历taskQueue队列，执行task
+    protected final boolean runAllTasksFrom(Queue<Runnable> taskQueue) {
+    	// 获得队头任务
+        Runnable task = pollTaskFrom(taskQueue);
+        if (task == null) {
+            return false;
+        }
+        for (;;) {
+        	// 执行任务
+            safeExecute(task);
+            task = pollTaskFrom(taskQueue);
+            if (task == null) {
+                return true;
+            }
+        }
     }
 
     protected Runnable takeTask() {
@@ -167,12 +207,65 @@ public abstract class SingleThreadEventExecutor extends AbstractScheduledEventEx
         boolean inEventLoop = inEventLoop();
         addTask(task);
         if (!inEventLoop) {
+        	// 创建线程
             startThread();
         }
+
+        // 唤醒线程
+        // 对于 Nio 使用的 NioEventLoop ，它的线程执行任务是基于 Selector 监听感兴趣的事件，
+        // 所以当任务添加到 taskQueue 队列中时，线程是无感知的，所以需要调用 #wakeup(boolean inEventLoop) 方法，进行主动的唤醒。
+     	if (!addTaskWakesUp && wakesUpForTask(task)) {
+        	wakeup(inEventLoop);
+     	}
+    }
+
+    private void doStartThread() {
+        executor.execute(new Runnable() {
+            @Override
+            public void run() {
+                thread = Thread.currentThread();
+                boolean success = false;
+                updateLastExecutionTime();
+                try {
+                	// 执行任务
+                    SingleThreadEventExecutor.this.run();
+                    success = true;
+                }finally {
+                   // 优雅关闭
+                	...
+                }
+            }
+        });
     }
 }
 
+public abstract class SingleThreadEventLoop extends SingleThreadEventExecutor implements EventLoop {
+	private final Queue<Runnable> tailTasks;
+
+	// NioEventLoop执行完所有任务后被调用
+	@Override
+    protected void afterRunningAllTasks() {
+        runAllTasksFrom(tailTasks);
+    }
+}
+
+// NioEventLoop实际上就是工作线程，可以直接理解为一个线程。
+// NioEventLoopGroup是一个线程池，线程池中的线程就是NioEventLoop。
 public final class NioEventLoop extends SingleThreadEventLoop {
+
+	// 每个NioEventLoop有它自己的selector
+	// 一个NioEventLoop的selector可以被多个Channel注册，也就是说多个Channel共享一个EventLoop
+	private Selector selector;
+	// 用来创建selector
+	private final SelectorProvider provider;
+
+	@Override
+    protected Queue<Runnable> newTaskQueue(int maxPendingTasks) {
+    	// 创建mpsc队列
+        // mpsc 是对多线程生产任务，单线程消费任务的消费，恰好符合 NioEventLoop 的情况。why？
+        return maxPendingTasks == Integer.MAX_VALUE ? PlatformDependent.<Runnable>newMpscQueue()
+                                                    : PlatformDependent.<Runnable>newMpscQueue(maxPendingTasks);
+    }
 
 	@Override
     public final void register(EventLoop eventLoop, final ChannelPromise promise) {
@@ -182,6 +275,7 @@ public final class NioEventLoop extends SingleThreadEventLoop {
 	    register0(promise);
     }
 
+    // 简单来说，run的执行顺序是一个循环：即 channel.select -> process selected keys -> run tasks -> channel.select ...
 	@Override
     protected void run() {
 		// 事件无限循环
@@ -190,22 +284,24 @@ public final class NioEventLoop extends SingleThreadEventLoop {
 			// 没有task就返回SelectStrategy.SELECT继续阻塞等待
 			switch (selectStrategy.calculateStrategy(selectNowSupplier, hasTasks())) {
 				case SelectStrategy.CONTINUE:
-					continue;
-				case SelectStrategy.SELECT:
+					continue; // 默认不会走到
+				case SelectStrategy.SELECT: // 没有就绪IO就走到这里，使用阻塞select策略
 					select(wakenUp.getAndSet(false));
 					if (wakenUp.get()) {
 						selector.wakeup();
 					}
 					// fall through
-				default:
+				default: // selectStrategy.calculateStrategy返回就绪IO，就会走到这里
 			}
 
 			// ioRatio表示这个thread分配给io和执行task的时间比
 			final int ioRatio = this.ioRatio;
 			if (ioRatio == 100) {
 				try {
+					// 处理 Channel 感兴趣的就绪 IO 事件。
 					processSelectedKeys();
 				} finally {
+					// 运行所有普通任务和定时任务，不限制时间
 					runAllTasks();
 				}
 			} else {
@@ -214,12 +310,21 @@ public final class NioEventLoop extends SingleThreadEventLoop {
 					// 实质会走到processSelectedKey
 					processSelectedKeys();
 				} finally {
+					// 这里会分配计算限制任务执行时间
 					final long ioTime = System.nanoTime() - ioStartTime;
 					runAllTasks(ioTime * (100 - ioRatio) / ioRatio);
 				}
 			}
         }
     }
+
+    // loop循环第一步，selectNow获取就绪IO
+    private final IntSupplier selectNowSupplier = new IntSupplier() {
+        @Override
+        public int get() throws Exception {
+            return selectNow();
+        }
+    };
 
 	// 调用NIO的selecor的非阻塞select
 	int selectNow() throws IOException {
@@ -229,6 +334,108 @@ public final class NioEventLoop extends SingleThreadEventLoop {
             // restore wakeup state if needed
             if (wakenUp.get()) {
                 selector.wakeup();
+            }
+        }
+    }
+
+    private void select(boolean oldWakenUp) throws IOException {
+    	// 本次loop期间select的次数
+        int selectCnt = 0;
+        long currentTimeNanos = System.nanoTime();
+        // 从定时任务队列里peek最近的任务到期时间，计算出selector阻塞的时长，没有任务缺省1秒
+        long selectDeadLineNanos = currentTimeNanos + delayNanos(currentTimeNanos);
+
+        for (;;) { //无限循环实现阻塞select
+        	// 本次select的超时时长
+            long timeoutMillis = (selectDeadLineNanos - currentTimeNanos + 500000L) / 1000000L;
+            // 超时时长小于0就结束select
+            if (timeoutMillis <= 0) {
+                if (selectCnt == 0) {
+                    selector.selectNow();
+                    selectCnt = 1;
+                }
+                break;
+            }
+
+            // 检查如果有新的任务进来就推出select
+            if (hasTasks() && wakenUp.compareAndSet(false, true)) {
+                selector.selectNow();
+                selectCnt = 1;
+                break;
+            }
+
+            // 开始阻塞select
+            int selectedKeys = selector.select(timeoutMillis);
+            selectCnt ++;
+
+            if (selectedKeys != 0 || oldWakenUp || wakenUp.get() || hasTasks() || hasScheduledTasks()) {
+                // - Selected something, 有就绪IO返回
+                // - waken up by user, or 该selector被其他线程唤醒
+                // - the task queue has a pending task. 有新任务
+                // - a scheduled task is ready for processing 或有新的定时任务
+                break;
+            }
+
+            long time = System.nanoTime();
+            if (time - TimeUnit.MILLISECONDS.toNanos(timeoutMillis) >= currentTimeNanos) {
+                // timeoutMillis elapsed without anything selected.
+                selectCnt = 1;
+            } else if (SELECTOR_AUTO_REBUILD_THRESHOLD > 0 &&
+                    selectCnt >= SELECTOR_AUTO_REBUILD_THRESHOLD) {
+            	// 不符合 select 超时的提交，若 select 次数到达重建 Selector 对象的上限，进行重建, 解决NIO空轮询的bug
+                // The selector returned prematurely many times in a row.
+                // Rebuild the selector to work around the problem.
+                logger.warn(
+                        "Selector.select() returned prematurely {} times in a row; rebuilding Selector {}.",
+                        selectCnt, selector);
+
+                rebuildSelector();
+                selector = this.selector;
+
+                // Select again to populate selectedKeys.
+                selector.selectNow();
+                selectCnt = 1;
+                break;
+            }
+
+            currentTimeNanos = time;
+        }
+    }
+
+    // 处理Channel新增就绪的IO事件
+    private void processSelectedKeys() {
+    	// 当 selectedKeys 非空，意味着使用优化的 SelectedSelectionKeySetSelector 
+	    if (selectedKeys != null) {
+	        processSelectedKeysOptimized(); // 一般都走到这里
+	    } else {
+	        processSelectedKeysPlain(selector.selectedKeys());
+	    }
+	}
+
+	private void processSelectedKeysOptimized() {
+        for (int i = 0; i < selectedKeys.size; ++i) {
+            final SelectionKey k = selectedKeys.keys[i];
+            // 置空允许GC回收
+            selectedKeys.keys[i] = null;
+
+            // 可以看到是通过Channel关联异步流程的？
+            final Object a = k.attachment();
+
+            if (a instanceof AbstractNioChannel) {
+                processSelectedKey(k, (AbstractNioChannel) a);
+            } else {
+                @SuppressWarnings("unchecked")
+                NioTask<SelectableChannel> task = (NioTask<SelectableChannel>) a;
+                processSelectedKey(k, task);
+            }
+
+            if (needsToSelectAgain) {
+                // null out entries in the array to allow to have it GC'ed once the Channel close
+                // See https://github.com/netty/netty/issues/2363
+                selectedKeys.reset(i + 1);
+
+                selectAgain();
+                i = -1;
             }
         }
     }
@@ -248,15 +455,24 @@ public final class NioEventLoop extends SingleThreadEventLoop {
 			unsafe.finishConnect();
 		}
 
-		// 可写
+		// 调用 Unsafe#forceFlush() 方法，向 Channel 写入数据。在完成写入数据后，会移除对 OP_WRITE 的感兴趣。
 		if ((readyOps & SelectionKey.OP_WRITE) != 0) {
 			ch.unsafe().forceFlush();
 		}
 
-		// 可读
+		// readyOps == 0 是对 JDK Bug 的处理，防止空的死循环
+		// 如果对 OP_READ 或 OP_ACCEPT 事件就绪：调用 Unsafe#read() 方法，处理读或者者接受客户端连接的事件。
 		if ((readyOps & (SelectionKey.OP_READ | SelectionKey.OP_ACCEPT)) != 0 || readyOps == 0) {
 			unsafe.read();
 		}
+    }
+}
+
+final class DefaultSelectStrategy implements SelectStrategy {
+	// 获取selector返回的就绪任务数
+    @Override
+    public int calculateStrategy(IntSupplier selectSupplier, boolean hasTasks) throws Exception {
+        return hasTasks ? selectSupplier.get() : SelectStrategy.SELECT;
     }
 }
 
