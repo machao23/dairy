@@ -84,6 +84,47 @@ public abstract class AbstractEventExecutor extends AbstractExecutorService impl
     }
 }
 
+final class ScheduledFutureTask<V> extends PromiseTask<V> implements ScheduledFuture<V>, PriorityQueueNode {
+
+	// 能进来说明任务到执行时间了
+	@Override
+    public void run() {
+        if (periodNanos == 0) { // 执行周期为“只执行一次”的定时任务
+        	// 设置任务不可取消
+            if (setUncancellableInternal()) {
+            	// 执行任务
+                V result = task.call();
+                // 通知任务执行成功
+                setSuccessInternal(result);
+            }
+        } else { // 执行周期为“固定周期”的定时任务
+            // check if is done as it may was cancelled
+            // 判断任务有没有被取消
+            if (!isCancelled()) {
+            	// 执行任务
+                task.call();
+                // 判断 EventExecutor没有关闭
+                if (!executor().isShutdown()) {
+                	// 计算下个周期执行赶时间
+                    long p = periodNanos;
+                    if (p > 0) {
+                        deadlineNanos += p;
+                    } else {
+                        deadlineNanos = nanoTime() - p;
+                    }
+                    if (!isCancelled()) {
+                        // scheduledTaskQueue can never be null as we lazy init it before submit the task!
+                        Queue<ScheduledFutureTask<?>> scheduledTaskQueue =
+                                ((AbstractScheduledEventExecutor) executor()).scheduledTaskQueue;
+                        // 重新添加到定时任务队列里，等待下次执行
+                        scheduledTaskQueue.add(this);
+                    }
+                }
+            }
+        }
+    }
+}
+
 // 在AbstractEventExecutor的基础上提供了对定时任务的支持
 public abstract class AbstractScheduledEventExecutor extends AbstractEventExecutor {
 	// 用来保存定时任务的队列
@@ -187,7 +228,7 @@ public abstract class SingleThreadEventExecutor extends AbstractScheduledEventEx
                     }
                 }
                 if (task == null) {
-                	// 继续尝试从定时任务队列里获取任务添加到taskQueue里
+                	// 继续尝试从定时任务队列里获取已经到执行时间的任务吗，添加到taskQueue里
                     fetchFromScheduledTaskQueue();
                     // 再尝试从taskQueue里获取任务
                     task = taskQueue.poll();
