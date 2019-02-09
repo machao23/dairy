@@ -197,6 +197,64 @@ public abstract class AbstractNioChannel extends AbstractChannel {
     }
 }
 
+public abstract class AbstractNioMessageChannel extends AbstractNioChannel {
+
+	// 内部Unsafe类
+	private final class NioMessageUnsafe extends AbstractNioUnsafe {
+
+		// 存放待读取客户端的连接channel
+        private final List<Object> readBuf = new ArrayList<Object>();
+
+        // 服务端在处理accept和read事件时被调用
+        @Override
+        public void read() {
+            assert eventLoop().inEventLoop();
+            final ChannelConfig config = config();
+            final ChannelPipeline pipeline = pipeline();
+            final RecvByteBufAllocator.Handle allocHandle = unsafe().recvBufAllocHandle();
+            allocHandle.reset(config);
+
+            Throwable exception = null;
+            try {
+                try {
+                    do {
+                        int localRead = doReadMessages(readBuf);
+                        // 没有读取的客户端连接
+                        if (localRead == 0) {
+                            break;
+                        }
+                        // 读取消息数量 + localRead
+                        allocHandle.incMessagesRead(localRead);
+                    } while (allocHandle.continueReading()); // 判断是否继续读取
+                } catch (Throwable t) {
+                    exception = t;
+                }
+
+                int size = readBuf.size();
+                // 循环 readBuf 数组，触发 Channel read 事件到 pipeline 中。
+                for (int i = 0; i < size; i ++) {
+                    readPending = false;
+                    pipeline.fireChannelRead(readBuf.get(i));
+                }
+                readBuf.clear();
+                allocHandle.readComplete();
+                // 触发 Channel readComplete 事件到 pipeline 中。
+                pipeline.fireChannelReadComplete();
+            } finally {
+                // Check if there is a readPending which was not processed yet.
+                // This could be for two reasons:
+                // * The user called Channel.read() or ChannelHandlerContext.read() in channelRead(...) method
+                // * The user called Channel.read() or ChannelHandlerContext.read() in channelReadComplete(...) method
+                //
+                // See https://github.com/netty/netty/issues/2254
+                if (!readPending && !config.isAutoRead()) {
+                    removeReadOp();
+                }
+            }
+        }
+    }
+}
+
 // Netty服务端的channel类
 public class NioServerSocketChannel extends AbstractNioMessageChannel
 							implements io.netty.channel.socket.ServerSocketChannel {
@@ -216,9 +274,12 @@ public class NioServerSocketChannel extends AbstractNioMessageChannel
         config = new NioServerSocketChannelConfig(this, javaChannel().socket());
     }
 
-	// 收到客户端连接请求
+	// 收到客户端连接请求，把客户端的channel加到buf里
+	// 是accpet阶段不是字面上的read阶段，所以添加的是channel，不是报文
+	// 在NioMessageUnsafe.doRead被调用，
 	@Override
     protected int doReadMessages(List<Object> buf) throws Exception {
+    	// 接受客户端连接
         SocketChannel ch = SocketUtils.accept(javaChannel());
 		buf.add(new NioSocketChannel(this, ch));
 		return 1;
@@ -235,7 +296,7 @@ public class ServerBootstrap extends AbstractBootstrap<ServerBootstrap, ServerCh
 	// childHandler就是ServerBootstrap在build的时候指定处理客户端请求的handler
 	private final ChannelHandler childHandler;
 
-	// 客户端连接进来会调用channelRead
+	// 客户端连接进来会调用channelRead，是accpet阶段不是字面上的read阶段，所以添加的是channel，不是报文
 	@Override
 	@SuppressWarnings("unchecked")
 	public void channelRead(ChannelHandlerContext ctx, Object msg) {
@@ -277,6 +338,48 @@ public class ServerBootstrap extends AbstractBootstrap<ServerBootstrap, ServerCh
                                 ch, currentChildGroup, currentChildHandler, currentChildOptions, currentChildAttrs));
                     }
                 });
+            }
+        });
+    }
+
+    // 内部handler类，在ServerBootstrap.init时候会被添加到pipeline
+    private static class ServerBootstrapAcceptor extends ChannelInboundHandlerAdapter {
+
+    	private final EventLoopGroup childGroup;
+
+    	// 将接受的客户端的 NioSocketChannel 注册到 EventLoop 中。
+    	@Override
+        public void channelRead(ChannelHandlerContext ctx, Object msg) {
+            final Channel child = (Channel) msg;
+
+            child.pipeline().addLast(childHandler);
+
+            setChannelOptions(child, childOptions, logger);
+
+            for (Entry<AttributeKey<?>, Object> e: childAttrs) {
+                child.attr((AttributeKey<Object>) e.getKey()).set(e.getValue());
+            }
+
+            // 注册
+            // 在注册完成之后，该 worker EventLoop 就会开始轮询该客户端是否有数据写入。
+            childGroup.register(child).addListener(new ChannelFutureListener() {
+                @Override
+                public void operationComplete(ChannelFuture future) throws Exception {
+
+                }
+            });
+        }
+    }
+}
+
+public final class SocketUtils {
+
+	// 调用JDK的ServerSocketChannelImpl.accept
+	public static SocketChannel accept(final ServerSocketChannel serverSocketChannel) throws IOException {
+        return AccessController.doPrivileged(new PrivilegedExceptionAction<SocketChannel>() {
+            @Override
+            public SocketChannel run() throws IOException {
+                return serverSocketChannel.accept();
             }
         });
     }
