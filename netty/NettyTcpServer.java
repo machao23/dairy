@@ -126,63 +126,6 @@ public abstract class AbstractBootstrap<B extends AbstractBootstrap<B, C>, C ext
     }
 }
 
-public abstract class AbstractChannel extends DefaultAttributeMap implements Channel {
-
-	// 一个channel一个selectionKey？
-	volatile SelectionKey selectionKey;
-
-	// 构造方法
-	protected AbstractChannel(Channel parent) {
-		// parent 属性，父 Channel 对象。对于 NioServerSocketChannel 的 parent 为空。
-	    this.parent = parent;
-	    // 创建 ChannelId 对象
-	    id = newId();
-	    // 创建 Unsafe 对象
-	    // 之所以叫Unsafe是因为 Unsafe 操作不允许被用户代码使用。这些函数是真正用于数据传输操作，必须被IO线程调用。
-	    unsafe = newUnsafe();
-	    // 创建 DefaultChannelPipeline 对象
-	    // 可以看到每个channel有自己的pipeline
-	    pipeline = newChannelPipeline();
-	}
-
-	protected abstract class AbstractUnsafe implements Unsafe {
-		@Override
-	    public final void bind(final SocketAddress localAddress, final ChannelPromise promise) {
-	    	// 记录channel是否被激活
-	        boolean wasActive = isActive();
-	        // 绑定channel的端口
-	        doBind(localAddress);
-
-	        // 若 Channel 是新激活的，
-	        if (!wasActive && isActive()) {
-	            invokeLater(new Runnable() {
-	                @Override
-	                public void run() {
-	                	// 触发通知 Channel 已激活的事件。
-	                    pipeline.fireChannelActive();
-	                }
-	            });
-	        }
-
-	        // 回调通知 promise 执行成功
-	        safeSetSuccess(promise);
-	    }
-
-	    // 注册channel到eventLoop时被调用
-	    @Override
-	    protected void doRegister() throws Exception {
-	        boolean selected = false;
-	        for (;;) {
-	        	// #unwrappedSelector() 方法，返回 Java 原生 NIO Selector 对象；每个 NioEventLoop 对象上，都独有一个 Selector 对象。
-	        	// 调用 #javaChannel() 方法，获得 Java 原生 NIO 的 Channel 对象。
-	        	// 注册 Java 原生 NIO 的 Channel 对象到 Selector 对象上
-                selectionKey = javaChannel().register(eventLoop().unwrappedSelector(), 0, this);
-                return;
-	        }
-	    }
-	}
-}
-
 public abstract class AbstractNioChannel extends AbstractChannel {
 	// 在Bootstrap成功bind后调用
 	@Override

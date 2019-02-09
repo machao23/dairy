@@ -258,35 +258,118 @@ public abstract class AbstractNioByteChannel extends AbstractNioChannel {
 }
 
 public abstract class AbstractChannel extends DefaultAttributeMap implements Channel {
+
+    // 一个channel一个selectionKey？
+    volatile SelectionKey selectionKey;
+
+    // 构造方法
+    protected AbstractChannel(Channel parent) {
+        // parent 属性，父 Channel 对象。对于 NioServerSocketChannel 的 parent 为空。
+        this.parent = parent;
+        // 创建 ChannelId 对象
+        id = newId();
+        // 创建 Unsafe 对象
+        // 之所以叫Unsafe是因为 Unsafe 操作不允许被用户代码使用。这些函数是真正用于数据传输操作，必须被IO线程调用。
+        unsafe = newUnsafe();
+        // 创建 DefaultChannelPipeline 对象
+        // 可以看到每个channel有自己的pipeline
+        pipeline = newChannelPipeline();
+    }
+
     @Override
     public final void register(EventLoop eventLoop, final ChannelPromise promise) {
-	// channel和eventloop产生引用关联
-	AbstractChannel.this.eventLoop = eventLoop;
+    	// channel和eventloop产生引用关联
+    	AbstractChannel.this.eventLoop = eventLoop;
 
-	if (eventLoop.inEventLoop()) {
-	    register0(promise);
-	} else {
-	    try {
-		eventLoop.execute(new Runnable() {
-			@Override
-			public void run() {
-			    register0(promise);
-			}
-		});
-	    } catch (Throwable t) {
-		logger.warn(
-		    "Force-closing a channel whose registration task was not accepted by an event loop: {}",
-		    AbstractChannel.this, t);
-		closeForcibly();
-		closeFuture.setClosed();
-		safeSetFailure(promise, t);
-	    }
-	}
+    	if (eventLoop.inEventLoop()) {
+    	    register0(promise);
+    	} else {
+    	    try {
+    		eventLoop.execute(new Runnable() {
+    			@Override
+    			public void run() {
+    			    register0(promise);
+    			}
+    		});
+    	    } catch (Throwable t) {
+    		logger.warn(
+    		    "Force-closing a channel whose registration task was not accepted by an event loop: {}",
+    		    AbstractChannel.this, t);
+    		closeForcibly();
+    		closeFuture.setClosed();
+    		safeSetFailure(promise, t);
+    	    }
+    	}
     }
 
     @Override
     public ChannelFuture connect(SocketAddress remoteAddress, ChannelPromise promise) {
         return pipeline.connect(remoteAddress, promise);
+    }
+
+    // 写数据被调用，委托给pipeline做
+    // DefaultChannelPipeline 会调用TailContext.write 把write事件从尾节点向头节点传播
+    @Override
+    public ChannelFuture write(Object msg) {
+        return pipeline.write(msg);
+    }
+
+    protected abstract class AbstractUnsafe implements Unsafe {
+        // 内存队列，用于缓存写入的数据( 消息 )。
+        private volatile ChannelOutboundBuffer outboundBuffer = new ChannelOutboundBuffer(AbstractChannel.this);
+
+        @Override
+        public final void bind(final SocketAddress localAddress, final ChannelPromise promise) {
+            // 记录channel是否被激活
+            boolean wasActive = isActive();
+            // 绑定channel的端口
+            doBind(localAddress);
+
+            // 若 Channel 是新激活的，
+            if (!wasActive && isActive()) {
+                invokeLater(new Runnable() {
+                    @Override
+                    public void run() {
+                        // 触发通知 Channel 已激活的事件。
+                        pipeline.fireChannelActive();
+                    }
+                });
+            }
+
+            // 回调通知 promise 执行成功
+            safeSetSuccess(promise);
+        }
+
+        // 注册channel到eventLoop时被调用
+        @Override
+        protected void doRegister() throws Exception {
+            boolean selected = false;
+            for (;;) {
+                // #unwrappedSelector() 方法，返回 Java 原生 NIO Selector 对象；每个 NioEventLoop 对象上，都独有一个 Selector 对象。
+                // 调用 #javaChannel() 方法，获得 Java 原生 NIO 的 Channel 对象。
+                // 注册 Java 原生 NIO 的 Channel 对象到 Selector 对象上
+                selectionKey = javaChannel().register(eventLoop().unwrappedSelector(), 0, this);
+                return;
+            }
+        }
+
+        // 在headContext最后处理write事件写数据时被调用
+        @Override
+        public final void write(Object msg, ChannelPromise promise) {
+            assertEventLoop();
+
+            ChannelOutboundBuffer outboundBuffer = this.outboundBuffer;
+            int size;
+            // 过滤写入的消息
+            msg = filterOutboundMessage(msg);
+            // 计算消息长度
+            size = pipeline.estimatorHandle().size(msg);
+            if (size < 0) {
+                size = 0;
+            }
+            // 写消息到内存队列
+            outboundBuffer.addMessage(msg, size, promise);
+        }
     }
 }
 
