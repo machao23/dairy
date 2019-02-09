@@ -139,6 +139,15 @@ public class NioSocketChannel extends AbstractNioByteChannel implements io.netty
             throw new Error();
         }
     }
+
+    // 读取channel自己本身的数据到byteBuf，
+    // 在父类AbstractNioByteChannel.read时候被调用
+    @Override
+    protected int doReadBytes(ByteBuf byteBuf) throws Exception {
+        final RecvByteBufAllocator.Handle allocHandle = unsafe().recvBufAllocHandle();
+        allocHandle.attemptedBytesRead(byteBuf.writableBytes());
+        return byteBuf.writeBytes(javaChannel(), allocHandle.attemptedBytesRead());
+    }
 }
 
 public abstract class AbstractNioByteChannel extends AbstractNioChannel {
@@ -152,7 +161,7 @@ public abstract class AbstractNioByteChannel extends AbstractNioChannel {
         super(parent);
         this.ch = ch;
         this.readInterestOp = readInterestOp;
-	// NIO默认设置成非阻塞
+	   // NIO默认设置成非阻塞
         ch.configureBlocking(false);
     }
 
@@ -160,9 +169,9 @@ public abstract class AbstractNioByteChannel extends AbstractNioChannel {
     protected AbstractChannel(Channel parent) {
         this.parent = parent;
         id = newId();
-	// NioSocketChannelUnsafe实例
+	   // NioSocketChannelUnsafe实例
         unsafe = newUnsafe();
-	// 每个channel有它自己的管道
+	   // 每个channel有它自己的管道
         pipeline = newChannelPipeline();
     }
 
@@ -170,17 +179,81 @@ public abstract class AbstractNioByteChannel extends AbstractNioChannel {
     //  -> 通过 next() 获取一个可用的 SingleThreadEventLoop ->  SingleThreadEventLoop.register -> AbstractUnsafe.register
     //  -> AbstractUnsafe.register0
     private void register0(ChannelPromise promise) {
-	// 调用具体channel子类的方法，NIO是把channel注册到eventLoop的selector上
-	doRegister();
+    	// 调用具体channel子类的方法，NIO是把channel注册到eventLoop的selector上
+    	doRegister();
 
-	pipeline.fireChannelRegistered();
+    	pipeline.fireChannelRegistered();
     }
 
     @Override
     protected void doRegister() throws Exception {
-	// 将底层的socketChannel注册到eventLoop的selector上
-	selectionKey = javaChannel().register(eventLoop().unwrappedSelector(), 0, this);
-	return;
+    	// 将底层的socketChannel注册到eventLoop的selector上
+    	selectionKey = javaChannel().register(eventLoop().unwrappedSelector(), 0, this);
+    	return;
+    }
+
+    protected class NioByteUnsafe extends AbstractNioUnsafe {
+        @Override
+        public final void read() {
+            final ChannelConfig config = config();
+            if (shouldBreakReadReady(config)) {
+                clearReadPending();
+                return;
+            }
+            final ChannelPipeline pipeline = pipeline();
+            final ByteBufAllocator allocator = config.getAllocator();
+            final RecvByteBufAllocator.Handle allocHandle = recvBufAllocHandle();
+            allocHandle.reset(config);
+
+            ByteBuf byteBuf = null;
+            boolean close = false; // 是否关闭连接
+            try {
+                do {
+                    byteBuf = allocHandle.allocate(allocator);
+                    // 读取数据，然后设置最后读取字节数
+                    allocHandle.lastBytesRead(doReadBytes(byteBuf));
+                    if (allocHandle.lastBytesRead() <= 0) { // 没有读取到数据，释放buffer
+                        // nothing was read. release the buffer.
+                        byteBuf.release();
+                        byteBuf = null;
+                        close = allocHandle.lastBytesRead() < 0; // 小于0说明对端已经关闭
+                        if (close) {
+                            // There is nothing left to read as we received an EOF.
+                            readPending = false;
+                        }
+                        break;
+                    }
+                    // 走到这里表示读取到数据了
+                    allocHandle.incMessagesRead(1);
+                    readPending = false;
+                    // 触发channelRead事件
+                    // 一般情况下，我们会在自己的 Netty 应用程序中，自定义 ChannelHandler 处理读取到的数据。
+                    // 最终会被 pipeline 中的尾节点 TailContext 所处理，释放ByteBuf对象
+                    pipeline.fireChannelRead(byteBuf);
+                    byteBuf = null;
+                } while (allocHandle.continueReading());
+
+                allocHandle.readComplete();
+                // 触发读取完成事件
+                pipeline.fireChannelReadComplete();
+
+                if (close) {
+                    closeOnRead(pipeline);
+                }
+            } catch (Throwable t) {
+                handleReadException(pipeline, byteBuf, t, close, allocHandle);
+            } finally {
+                // Check if there is a readPending which was not processed yet.
+                // This could be for two reasons:
+                // * The user called Channel.read() or ChannelHandlerContext.read() in channelRead(...) method
+                // * The user called Channel.read() or ChannelHandlerContext.read() in channelReadComplete(...) method
+                //
+                // See https://github.com/netty/netty/issues/2254
+                if (!readPending && !config.isAutoRead()) {
+                    removeReadOp();
+                }
+            }
+        }
     }
 }
 

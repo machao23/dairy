@@ -276,11 +276,13 @@ public class NioServerSocketChannel extends AbstractNioMessageChannel
 
 	// 收到客户端连接请求，把客户端的channel加到buf里
 	// 是accpet阶段不是字面上的read阶段，所以添加的是channel，不是报文
+	// NioServerSocketChannel 读取新的连接。
 	// 在NioMessageUnsafe.doRead被调用，
 	@Override
     protected int doReadMessages(List<Object> buf) throws Exception {
     	// 接受客户端连接
         SocketChannel ch = SocketUtils.accept(javaChannel());
+        // 创建NioSocketChannel,新的数据交给NioSocketChannel读取，这样的设计也保证客户端和服务端能够复用。
 		buf.add(new NioSocketChannel(this, ch));
 		return 1;
     }
