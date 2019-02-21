@@ -184,20 +184,28 @@ final class PooledDirectByteBuf extends PooledByteBuf<ByteBuffer> {
 }
 
 final class PooledUnsafeDirectByteBuf extends PooledByteBuf<ByteBuffer> {
+
+	/**
+	 * 内存地址
+	 */
+	private long memoryAddress;
+
 	@Override
 	void init(PoolChunk<ByteBuffer> chunk, long handle, int offset, int length, int maxLength,
 	          PoolThreadCache cache) {
-	    // 调用父初始化方法
 	    super.init(chunk, handle, offset, length, maxLength, cache);
 	    // 初始化内存地址
-	    initMemoryAddress(); // <1>
+	    initMemoryAddress(); 
 	}
 
 	@Override
 	void initUnpooled(PoolChunk<ByteBuffer> chunk, int length) {
-	    // 调用父初始化方法
 	    super.initUnpooled(chunk, length);
 	    // 初始化内存地址
-	    initMemoryAddress(); // <2>
+	    initMemoryAddress();
+	}
+
+	private void initMemoryAddress() {
+	    memoryAddress = PlatformDependent.directBufferAddress(memory) + offset; // <2>
 	}
 }
