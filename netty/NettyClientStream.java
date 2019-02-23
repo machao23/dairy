@@ -148,6 +148,104 @@ public class NioSocketChannel extends AbstractNioByteChannel implements io.netty
         allocHandle.attemptedBytesRead(byteBuf.writableBytes());
         return byteBuf.writeBytes(javaChannel(), allocHandle.attemptedBytesRead());
     }
+
+    @Override
+    protected void doWrite(ChannelOutboundBuffer in) throws Exception {
+        SocketChannel ch = javaChannel();
+        int writeSpinCount = config().getWriteSpinCount();
+        do {
+            // 内存队列为空，结束循环，直接返回
+            if (in.isEmpty()) {
+                // All written so clear OP_WRITE
+                clearOpWrite();
+                // Directly return here so incompleteWrite(...) is not called.
+                return;
+            }
+
+            // 获得每次写入的最大字节数
+            // Ensure the pending writes are made of ByteBufs only.
+            int maxBytesPerGatheringWrite = ((NioSocketChannelConfig) config).getMaxBytesPerGatheringWrite();
+            ByteBuffer[] nioBuffers = in.nioBuffers(1024, maxBytesPerGatheringWrite);
+            // 写入的 ByteBuffer 数组的个数
+            int nioBufferCnt = in.nioBufferCount();
+
+            // Always us nioBuffers() to workaround data-corruption.
+            // See https://github.com/netty/netty/issues/2761
+            switch (nioBufferCnt) {
+                case 0:
+                    // We have something else beside ByteBuffers to write so fallback to normal writes.
+                    writeSpinCount -= doWrite0(in);
+                    break;
+                case 1: {
+                    // Only one ByteBuf so use non-gathering write
+                    // Zero length buffers are not added to nioBuffers by ChannelOutboundBuffer, so there is no need
+                    // to check if the total size of all the buffers is non-zero.
+                    // 执行 NIO write 调用，写入单个 ByteBuffer 对象到对端
+                    ByteBuffer buffer = nioBuffers[0];
+                    int attemptedBytes = buffer.remaining();
+                    final int localWrittenBytes = ch.write(buffer);
+                    // 写入字节小于等于 0 ，说明 NIO Channel 不可写，
+                    // 所以 incompleteWrite 方法里注册 SelectionKey.OP_WRITE ，等待 NIO Channel 可写，并返回以结束循环
+                    if (localWrittenBytes <= 0) {
+                        incompleteWrite(true);
+                        return;
+                    }
+                    // 调整每次写入的最大字节数
+                    adjustMaxBytesPerGatheringWrite(attemptedBytes, localWrittenBytes, maxBytesPerGatheringWrite);
+                    // 从内存队列中，移除已经写入的数据( 消息 )
+                    in.removeBytes(localWrittenBytes);
+                    --writeSpinCount;
+                    break;
+                }
+                default: {
+                    // Zero length buffers are not added to nioBuffers by ChannelOutboundBuffer, so there is no need
+                    // to check if the total size of all the buffers is non-zero.
+                    // We limit the max amount to int above so cast is safe
+                    long attemptedBytes = in.nioBufferSize();
+                    // 执行 NIO write 调用，写入多个 ByteBuffer 到对端
+                    final long localWrittenBytes = ch.write(nioBuffers, 0, nioBufferCnt);
+                    if (localWrittenBytes <= 0) {
+                        incompleteWrite(true);
+                        return;
+                    }
+                    // Casting to int is safe because we limit the total amount of data in the nioBuffers to int above.
+                    adjustMaxBytesPerGatheringWrite((int) attemptedBytes, (int) localWrittenBytes,
+                            maxBytesPerGatheringWrite);
+                    in.removeBytes(localWrittenBytes);
+                    --writeSpinCount;
+                    break;
+                }
+            }
+        } while (writeSpinCount > 0);
+
+        incompleteWrite(writeSpinCount < 0);
+    }
+}
+
+// 负责保存写数据的内存队列
+public final class ChannelOutboundBuffer {
+    // 指向下一条 Entry 。通过它，形成 ChannelOutboundBuffer 内部的链式存储每条写入数据的数据结构。
+    Entry next;
+
+    /**
+     * 消息（数据）
+     */
+    Object msg;
+
+    // 当数据写入成功后，可以通过它回调通知结果。
+    ChannelPromise promise;
+
+    // 在 write 操作时，将数据写到 ChannelOutboundBuffer 中，都会产生一个 Entry 对象
+    static final class Entry {
+
+        // RECYCLER 静态属性，用于重用 Entry 对象。
+        private static final Recycler<Entry> RECYCLER = new Recycler<Entry>() {
+            @Override
+            protected Entry newObject(Handle<Entry> handle) {
+                return new Entry(handle);
+            }
+        };
+    }
 }
 
 public abstract class AbstractNioByteChannel extends AbstractNioChannel {
@@ -314,6 +412,14 @@ public abstract class AbstractChannel extends DefaultAttributeMap implements Cha
         return pipeline.write(msg);
     }
 
+    // 同write，委托给pipeline做flush
+    // 也是先从TailContext开始，到HeadContext结束，调用unsafe.flush
+    @Override
+    public Channel flush() {
+        pipeline.flush();
+        return this;
+    }
+
     protected abstract class AbstractUnsafe implements Unsafe {
         // 内存队列，用于缓存写入的数据( 消息 )。
         private volatile ChannelOutboundBuffer outboundBuffer = new ChannelOutboundBuffer(AbstractChannel.this);
@@ -361,6 +467,7 @@ public abstract class AbstractChannel extends DefaultAttributeMap implements Cha
             ChannelOutboundBuffer outboundBuffer = this.outboundBuffer;
             int size;
             // 过滤写入的消息
+            // 这里会判断如果使用堆外内存，需要封装成DirectByteBuffer
             msg = filterOutboundMessage(msg);
             // 计算消息长度
             size = pipeline.estimatorHandle().size(msg);
@@ -369,6 +476,30 @@ public abstract class AbstractChannel extends DefaultAttributeMap implements Cha
             }
             // 写消息到内存队列
             outboundBuffer.addMessage(msg, size, promise);
+        }
+
+        @Override
+        public final void flush() {
+            assertEventLoop();
+
+            ChannelOutboundBuffer outboundBuffer = this.outboundBuffer;
+            // 标记内存队列开始 flush
+            outboundBuffer.addFlush();
+            // 执行flush
+            flush0();
+        }
+
+        protected void flush0() {
+
+            final ChannelOutboundBuffer outboundBuffer = this.outboundBuffer;
+            inFlush0 = true;
+
+            try {
+                // 执行真正的写入到对端
+                doWrite(outboundBuffer);
+            } finally {
+                inFlush0 = false;
+            }
         }
     }
 }
