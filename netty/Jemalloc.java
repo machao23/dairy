@@ -6,8 +6,11 @@ final class PoolChunk<T> implements PoolChunkMetric {
 	final T memory;
 
 	// 是否非池化
-	// 默认情况下，对于 分配 16M 以内的内存空间时，Netty 会分配一个 Normal 类型的 Chunk 块。
+	// 池化情况下，对于 分配 16M 以内的内存空间时，Netty 会分配一个 Normal 类型的 Chunk 块。 
 	// 并且，该 Chunk 块在使用完后，进行池化缓存，重复使用。
+
+	// 非池化情况下，对于分配 16M 以上的内存空间时，Netty 会分配一个 Huge 类型的特殊的 Chunk 块。
+	// 并且，由于 Huge 类型的 Chunk 占用内存空间较大，比较特殊，所以该 Chunk 块在使用完后，立即释放，不进行重复使用。
 	final boolean unpooled;
 
 	/**
@@ -203,4 +206,72 @@ final class PoolChunk<T> implements PoolChunkMetric {
         updateParentsAlloc(id);
         return id;
     }
+}
+
+// 虽然，PoolSubpage 类的命名是“Subpage”，实际描述的是，Page 切分为多个 Subpage 内存块的分配情况。
+final class PoolSubpage<T> implements PoolSubpageMetric {
+	/**
+	 * 所属 PoolChunk 对象
+	 */
+	final PoolChunk<T> chunk;
+	/**
+	 * 在 {@link PoolChunk#memoryMap} 的节点编号
+	 */
+	private final int memoryMapIdx;
+	/**
+	 * 在 Chunk 中，偏移字节量
+	 *
+	 * @see PoolChunk#runOffset(int) 
+	 */
+	private final int runOffset;
+	/**
+	 * Page 大小 {@link PoolChunk#pageSize}
+	 */
+	private final int pageSize;
+
+	/**
+	 * Subpage 分配信息数组
+	 *
+	 * 每个 long 的 bits 位代表一个 Subpage 是否分配。
+	 * 因为 PoolSubpage 可能会超过 64 个( long 的 bits 位数 )，所以使用数组。
+	 *   例如：Page 默认大小为 8KB ，Subpage 默认最小为 16 B ，所以一个 Page 最多可包含 8 * 1024 / 16 = 512 个 Subpage 。
+	 *        因此，bitmap 数组大小为 512 / 64 = 8 。
+	 * 另外，bitmap 的数组大小，使用 {@link #bitmapLength} 来标记。或者说，bitmap 数组，默认按照 Subpage 的大小为 16B 来初始化。
+	 *    为什么是这样的设定呢？因为 PoolSubpage 可重用，通过 {@link #init(PoolSubpage, int)} 进行重新初始化。
+	 */
+	private final long[] bitmap;
+
+	/**
+	 * 双向链表，前一个 PoolSubpage 对象
+	 */
+	PoolSubpage<T> prev;
+	/**
+	 * 双向链表，后一个 PoolSubpage 对象
+	 */
+	PoolSubpage<T> next;
+
+	/**
+	 * 是否未销毁
+	 */
+	boolean doNotDestroy;
+	/**
+	 * 每个 Subpage 的占用内存大小
+	 */
+	int elemSize;
+	/**
+	 * 总共 Subpage 的数量
+	 */
+	private int maxNumElems;
+	/**
+	 * {@link #bitmap} 长度
+	 */
+	private int bitmapLength;
+	/**
+	 * 下一个可分配 Subpage 的数组位置
+	 */
+	private int nextAvail;
+	/**
+	 * 剩余可用 Subpage 的数量
+	 */
+	private int numAvail;
 }
