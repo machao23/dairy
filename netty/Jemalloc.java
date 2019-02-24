@@ -209,6 +209,7 @@ final class PoolChunk<T> implements PoolChunkMetric {
 }
 
 // 虽然，PoolSubpage 类的命名是“Subpage”，实际描述的是，Page 切分为多个 Subpage 内存块的分配情况。
+// 即这个类表示的其实是一个被切分成多个subPage的Page用来分配小对象的，因为有些Page分配给超过8K的大对象时候s是不能被切分的
 final class PoolSubpage<T> implements PoolSubpageMetric {
 	/**
 	 * 所属 PoolChunk 对象
@@ -274,4 +275,186 @@ final class PoolSubpage<T> implements PoolSubpageMetric {
 	 * 剩余可用 Subpage 的数量
 	 */
 	private int numAvail;
+}
+
+final class PoolChunkList<T> implements PoolChunkListMetric {
+	/**
+	 * 所属 PoolArena 对象
+	 */
+	private final PoolArena<T> arena;
+	/**
+	 * 下一个 PoolChunkList 对象
+	 * 也就是说，PoolChunkList 除了自身有一条双向链表外，PoolChunkList 和 PoolChunkList 之间也形成了一条双向链表
+	 */
+	private final PoolChunkList<T> nextList;
+	/**
+	 * Chunk 最小内存使用率
+	 */
+	private final int minUsage;
+	/**
+	 * Chunk 最大内存使用率
+	 * 当 Chunk 分配的内存率超过 maxUsage 时，从当前 PoolChunkList 节点移除，添加到下一个 PoolChunkList 节点
+	 */
+	private final int maxUsage;
+	/**
+	 * 每个 Chunk 最大可分配的容量
+	 *
+	 * @see #calculateMaxCapacity(int, int) 方法
+	 */
+	private final int maxCapacity;
+	/**
+	 * PoolChunk 头节点
+	 */
+	private PoolChunk<T> head;
+
+	/**
+	 * 前一个 PoolChunkList 对象
+	 */
+	// This is only update once when create the linked like list of PoolChunkList in PoolArena constructor.
+	private PoolChunkList<T> prevList;
+}
+
+abstract class PoolArena<T> implements PoolArenaMetric {
+
+	/**
+	 * 是否支持 Unsafe 操作
+	 */
+	static final boolean HAS_UNSAFE = PlatformDependent.hasUnsafe();
+
+	/**
+	 * 内存分类
+	 */
+	enum SizeClass {
+	    Tiny,
+	    Small,
+	    Normal
+
+	    // 还有一个隐藏的，Huge
+	}
+
+	/**
+	 * {@link #tinySubpagePools} 数组的大小
+	 *
+	 * 默认为 32
+	 */
+	static final int numTinySubpagePools = 512 >>> 4;
+
+	/**
+	 * 所属 PooledByteBufAllocator 对象
+	 */
+	final PooledByteBufAllocator parent;
+
+	/**
+	 * 满二叉树的高度。默认为 11 。
+	 */
+	private final int maxOrder;
+	/**
+	 * Page 大小，默认 8KB = 8192B
+	 */
+	final int pageSize;
+	/**
+	 * 从 1 开始左移到 {@link #pageSize} 的位数。默认 13 ，1 << 13 = 8192 。
+	 */
+	final int pageShifts;
+	/**
+	 * Chunk 内存块占用大小。默认为 16M = 16 * 1024  。
+	 */
+	final int chunkSize;
+	/**
+	 * 判断分配请求内存是否为 Tiny/Small ，即分配 Subpage 内存块。
+	 *
+	 * Used to determine if the requested capacity is equal to or greater than pageSize.
+	 */
+	final int subpageOverflowMask;
+
+	/**
+	 * {@link #smallSubpagePools} 数组的大小
+	 *
+	 * 默认为 23
+	 */
+	final int numSmallSubpagePools;
+
+	/**
+	 * 对齐基准
+	 */
+	final int directMemoryCacheAlignment;
+	/**
+	 * {@link #directMemoryCacheAlignment} 掩码
+	 */
+	final int directMemoryCacheAlignmentMask;
+
+	/**
+	 * tiny 类型的 PoolSubpage 数组
+	 *
+	 * 数组的每个元素，都是双向链表
+	 */
+	private final PoolSubpage<T>[] tinySubpagePools;
+	/**
+	 * small 类型的 SubpagePools 数组
+	 *
+ * 数组的每个元素，都是双向链表
+ */
+private final PoolSubpage<T>[] smallSubpagePools;
+
+// PoolChunkList 之间的双向链表
+
+private final PoolChunkList<T> q050;
+private final PoolChunkList<T> q025;
+private final PoolChunkList<T> q000;
+private final PoolChunkList<T> qInit;
+private final PoolChunkList<T> q075;
+private final PoolChunkList<T> q100;
+
+/**
+ * PoolChunkListMetric 数组
+ */
+private final List<PoolChunkListMetric> chunkListMetrics;
+
+// Metrics for allocations and deallocations
+/**
+ * 分配 Normal 内存块的次数
+ */
+private long allocationsNormal;
+// We need to use the LongCounter here as this is not guarded via synchronized block.
+/**
+ * 分配 Tiny 内存块的次数
+ */
+private final LongCounter allocationsTiny = PlatformDependent.newLongCounter();
+/**
+ * 分配 Small 内存块的次数
+ */
+private final LongCounter allocationsSmall = PlatformDependent.newLongCounter();
+/**
+ * 分配 Huge 内存块的次数
+ */
+private final LongCounter allocationsHuge = PlatformDependent.newLongCounter();
+/**
+ * 正在使用中的 Huge 内存块的总共占用字节数
+ */
+private final LongCounter activeBytesHuge = PlatformDependent.newLongCounter();
+
+/**
+ * 释放 Tiny 内存块的次数
+ */
+private long deallocationsTiny;
+/**
+ * 释放 Small 内存块的次数
+ */
+private long deallocationsSmall;
+/**
+ * 释放 Normal 内存块的次数
+ */
+private long deallocationsNormal;
+
+/**
+ * 释放 Huge 内存块的次数
+ */
+// We need to use the LongCounter here as this is not guarded via synchronized block.
+private final LongCounter deallocationsHuge = PlatformDependent.newLongCounter();
+
+/**
+ * 该 PoolArena 被多少线程引用的计数器
+ */
+// Number of thread caches backed by this arena.
+final AtomicInteger numThreadCaches = new AtomicInteger();	
 }
