@@ -230,6 +230,16 @@ final class PooledUnsafeDirectByteBuf extends PooledByteBuf<ByteBuffer> {
 	}
 }
 
+// 堆内存ByteBuf版本
+final class PooledUnsafeHeapByteBuf extends PooledHeapByteBuf {
+    // 类似Direct，从RECYCLE里重用ByteBuf
+    static PooledUnsafeHeapByteBuf newUnsafeInstance(int maxCapacity) {
+        PooledUnsafeHeapByteBuf buf = RECYCLER.get();
+        buf.reuse(maxCapacity);
+        return buf;
+    }
+}
+
 public interface ReferenceCounted {
 
     /**

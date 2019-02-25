@@ -392,69 +392,138 @@ abstract class PoolArena<T> implements PoolArenaMetric {
 	/**
 	 * small 类型的 SubpagePools 数组
 	 *
- * 数组的每个元素，都是双向链表
- */
-private final PoolSubpage<T>[] smallSubpagePools;
+	 * 数组的每个元素，都是双向链表
+	 */
+	private final PoolSubpage<T>[] smallSubpagePools;
 
-// PoolChunkList 之间的双向链表
+	// PoolChunkList 之间的双向链表
+	private final PoolChunkList<T> q050;
+	private final PoolChunkList<T> q025;
+	private final PoolChunkList<T> q000;
+	private final PoolChunkList<T> qInit;
+	private final PoolChunkList<T> q075;
+	private final PoolChunkList<T> q100;
 
-private final PoolChunkList<T> q050;
-private final PoolChunkList<T> q025;
-private final PoolChunkList<T> q000;
-private final PoolChunkList<T> qInit;
-private final PoolChunkList<T> q075;
-private final PoolChunkList<T> q100;
+	/**
+	 * PoolChunkListMetric 数组
+	 */
+	private final List<PoolChunkListMetric> chunkListMetrics;
 
-/**
- * PoolChunkListMetric 数组
- */
-private final List<PoolChunkListMetric> chunkListMetrics;
+	// Metrics for allocations and deallocations
+	/**
+	 * 分配 Normal 内存块的次数
+	 */
+	private long allocationsNormal;
+	// We need to use the LongCounter here as this is not guarded via synchronized block.
+	/**
+	 * 分配 Tiny 内存块的次数
+	 */
+	private final LongCounter allocationsTiny = PlatformDependent.newLongCounter();
+	/**
+	 * 分配 Small 内存块的次数
+	 */
+	private final LongCounter allocationsSmall = PlatformDependent.newLongCounter();
+	/**
+	 * 分配 Huge 内存块的次数
+	 */
+	private final LongCounter allocationsHuge = PlatformDependent.newLongCounter();
+	/**
+	 * 正在使用中的 Huge 内存块的总共占用字节数
+	 */
+	private final LongCounter activeBytesHuge = PlatformDependent.newLongCounter();
 
-// Metrics for allocations and deallocations
-/**
- * 分配 Normal 内存块的次数
- */
-private long allocationsNormal;
-// We need to use the LongCounter here as this is not guarded via synchronized block.
-/**
- * 分配 Tiny 内存块的次数
- */
-private final LongCounter allocationsTiny = PlatformDependent.newLongCounter();
-/**
- * 分配 Small 内存块的次数
- */
-private final LongCounter allocationsSmall = PlatformDependent.newLongCounter();
-/**
- * 分配 Huge 内存块的次数
- */
-private final LongCounter allocationsHuge = PlatformDependent.newLongCounter();
-/**
- * 正在使用中的 Huge 内存块的总共占用字节数
- */
-private final LongCounter activeBytesHuge = PlatformDependent.newLongCounter();
+	/**
+	 * 释放 Tiny 内存块的次数
+	 */
+	private long deallocationsTiny;
+	/**
+	 * 释放 Small 内存块的次数
+	 */
+	private long deallocationsSmall;
+	/**
+	 * 释放 Normal 内存块的次数
+	 */
+	private long deallocationsNormal;
 
-/**
- * 释放 Tiny 内存块的次数
- */
-private long deallocationsTiny;
-/**
- * 释放 Small 内存块的次数
- */
-private long deallocationsSmall;
-/**
- * 释放 Normal 内存块的次数
- */
-private long deallocationsNormal;
+	/**
+	 * 释放 Huge 内存块的次数
+	 */
+	// We need to use the LongCounter here as this is not guarded via synchronized block.
+	private final LongCounter deallocationsHuge = PlatformDependent.newLongCounter();
 
-/**
- * 释放 Huge 内存块的次数
- */
-// We need to use the LongCounter here as this is not guarded via synchronized block.
-private final LongCounter deallocationsHuge = PlatformDependent.newLongCounter();
+	/**
+	 * 该 PoolArena 被多少线程引用的计数器
+	 */
+	// Number of thread caches backed by this arena.
+	final AtomicInteger numThreadCaches = new AtomicInteger();	
 
-/**
- * 该 PoolArena 被多少线程引用的计数器
- */
-// Number of thread caches backed by this arena.
-final AtomicInteger numThreadCaches = new AtomicInteger();	
+	PooledByteBuf<T> allocate(PoolThreadCache cache, int reqCapacity, int maxCapacity) {
+		// 从RECYCLE池子里复用ByteBuf
+        PooledByteBuf<T> buf = newByteBuf(maxCapacity);
+        allocate(cache, buf, reqCapacity);
+        return buf;
+    }
+
+    // 分配内存块给 PooledByteBuf 对象
+    private void allocate(PoolThreadCache cache, PooledByteBuf<T> buf, final int reqCapacity) {
+    	// 标准化请求分配的容量
+        final int normCapacity = normalizeCapacity(reqCapacity);
+        if (isTinyOrSmall(normCapacity)) { // capacity < pageSize
+            int tableIdx;
+            PoolSubpage<T>[] table;
+            boolean tiny = isTiny(normCapacity);
+            if (tiny) { // < 512
+                if (cache.allocateTiny(this, buf, reqCapacity, normCapacity)) {
+                    // was able to allocate out of the cache so move on
+                    return;
+                }
+                tableIdx = tinyIdx(normCapacity);
+                table = tinySubpagePools;
+            } else {
+                if (cache.allocateSmall(this, buf, reqCapacity, normCapacity)) {
+                    // was able to allocate out of the cache so move on
+                    return;
+                }
+                tableIdx = smallIdx(normCapacity);
+                table = smallSubpagePools;
+            }
+
+            final PoolSubpage<T> head = table[tableIdx];
+
+            /**
+             * Synchronize on the head. This is needed as {@link PoolChunk#allocateSubpage(int)} and
+             * {@link PoolChunk#free(long)} may modify the doubly linked list as well.
+             */
+            synchronized (head) {
+                final PoolSubpage<T> s = head.next;
+                if (s != head) {
+                    assert s.doNotDestroy && s.elemSize == normCapacity;
+                    long handle = s.allocate();
+                    assert handle >= 0;
+                    s.chunk.initBufWithSubpage(buf, handle, reqCapacity);
+                    incTinySmallAllocation(tiny);
+                    return;
+                }
+            }
+            synchronized (this) {
+                allocateNormal(buf, reqCapacity, normCapacity);
+            }
+
+            incTinySmallAllocation(tiny);
+            return;
+        }
+        if (normCapacity <= chunkSize) {
+            if (cache.allocateNormal(this, buf, reqCapacity, normCapacity)) {
+                // was able to allocate out of the cache so move on
+                return;
+            }
+            synchronized (this) {
+                allocateNormal(buf, reqCapacity, normCapacity);
+                ++allocationsNormal;
+            }
+        } else {
+            // Huge allocations are never served via the cache so just call allocateHuge
+            allocateHuge(buf, reqCapacity);
+        }
+    }
 }

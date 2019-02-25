@@ -57,3 +57,22 @@ public abstract class AbstractByteBufAllocator implements ByteBufAllocator {
 	    return heapBuffer(DEFAULT_INITIAL_CAPACITY);
 	}
 }
+
+// 基于内存池的 ByteBuf 的分配器；而 PooledByteBufAllocator 的内存池，是基于 Jemalloc 算法进行分配管理
+public class PooledByteBufAllocator extends AbstractByteBufAllocator implements ByteBufAllocatorMetricProvider {
+
+	@Override
+	protected ByteBuf newHeapBuffer(int initialCapacity, int maxCapacity) {
+	    // 获得线程的 PoolThreadCache 对象
+	    PoolThreadCache cache = threadCache.get();
+	    PoolArena<byte[]> heapArena = cache.heapArena;
+
+	    // 从 heapArena(类型是poolArena) 中，分配 Heap PooledByteBuf 对象，基于池化
+	    final ByteBuf buf;
+	    if (heapArena != null) {
+	        buf = heapArena.allocate(cache, initialCapacity, maxCapacity);
+	    } 
+
+	    return toLeakAwareBuffer(buf);
+	}
+}
