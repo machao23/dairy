@@ -459,20 +459,24 @@ abstract class PoolArena<T> implements PoolArenaMetric {
 
 	PooledByteBuf<T> allocate(PoolThreadCache cache, int reqCapacity, int maxCapacity) {
 		// 从RECYCLE池子里复用ByteBuf
+		// 和DirectArena的区别就是这个newByteBuf的抽象方法，创建什么样类型的ByteBuf，后续的申请内存池逻辑都是一样的
         PooledByteBuf<T> buf = newByteBuf(maxCapacity);
         allocate(cache, buf, reqCapacity);
         return buf;
     }
 
     // 分配内存块给 PooledByteBuf 对象
+    // 被 PooledBytebufAllocator.newHeapBuffer调用 （这个Allocator是再channel的config里配置好的）
     private void allocate(PoolThreadCache cache, PooledByteBuf<T> buf, final int reqCapacity) {
     	// 标准化请求分配的容量
         final int normCapacity = normalizeCapacity(reqCapacity);
+        // PoolSubpage 的情况
         if (isTinyOrSmall(normCapacity)) { // capacity < pageSize
             int tableIdx;
             PoolSubpage<T>[] table;
             boolean tiny = isTiny(normCapacity);
             if (tiny) { // < 512
+            	// 从 PoolThreadCache 缓存中，分配 tiny 内存块，并初始化到 PooledByteBuf 中。
                 if (cache.allocateTiny(this, buf, reqCapacity, normCapacity)) {
                     // was able to allocate out of the cache so move on
                     return;
@@ -480,6 +484,7 @@ abstract class PoolArena<T> implements PoolArenaMetric {
                 tableIdx = tinyIdx(normCapacity);
                 table = tinySubpagePools;
             } else {
+            	// 从 PoolThreadCache 缓存中，分配 small 内存块，并初始化到 PooledByteBuf 中。
                 if (cache.allocateSmall(this, buf, reqCapacity, normCapacity)) {
                     // was able to allocate out of the cache so move on
                     return;
@@ -491,6 +496,7 @@ abstract class PoolArena<T> implements PoolArenaMetric {
             final PoolSubpage<T> head = table[tableIdx];
 
             /**
+             * 从 PoolSubpage 链表中，分配 Subpage 内存块
              * Synchronize on the head. This is needed as {@link PoolChunk#allocateSubpage(int)} and
              * {@link PoolChunk#free(long)} may modify the doubly linked list as well.
              */
@@ -498,13 +504,20 @@ abstract class PoolArena<T> implements PoolArenaMetric {
                 final PoolSubpage<T> s = head.next;
                 if (s != head) {
                     assert s.doNotDestroy && s.elemSize == normCapacity;
+                    // 分配 Subpage 内存块
                     long handle = s.allocate();
                     assert handle >= 0;
+                    // 初始化 Subpage 内存块到 PooledByteBuf 对象中
                     s.chunk.initBufWithSubpage(buf, handle, reqCapacity);
+                    // 增加 allocationsTiny 或 allocationsSmall 计数
                     incTinySmallAllocation(tiny);
+                    // 返回，因为已经分配成功
                     return;
                 }
             }
+
+            // 在 PoolSubpage 链表中，分配不到 Subpage 内存块，所以申请 Normal Page 内存块。
+            // 申请 Normal Page 内存块。实际上，只占用其中一块 Subpage 内存块。
             synchronized (this) {
                 allocateNormal(buf, reqCapacity, normCapacity);
             }
@@ -513,6 +526,7 @@ abstract class PoolArena<T> implements PoolArenaMetric {
             return;
         }
         if (normCapacity <= chunkSize) {
+        	// 分配 normal 内存块，即一个 Chunk 中的 Page 内存块
             if (cache.allocateNormal(this, buf, reqCapacity, normCapacity)) {
                 // was able to allocate out of the cache so move on
                 return;
@@ -524,6 +538,239 @@ abstract class PoolArena<T> implements PoolArenaMetric {
         } else {
             // Huge allocations are never served via the cache so just call allocateHuge
             allocateHuge(buf, reqCapacity);
+        }
+    }
+
+    void free(PoolChunk<T> chunk, long handle, int normCapacity, PoolThreadCache cache) {
+        SizeClass sizeClass = sizeClass(normCapacity);
+        // 释放chunk时候，优先是放回到 PoolThreadCache 里复用
+        // 如果 PoolThreadCache.MemoroyRegionCache 存放内存块 Entry 的队列满了，就只能释放这个chunk了
+        if (cache != null && cache.add(this, chunk, handle, normCapacity, sizeClass)) {
+            // cached so not free it.
+            return;
+        }
+
+        freeChunk(chunk, handle, sizeClass);
+    }
+}
+
+// 每个线程引入其独有的 tcache 线程缓存（实现原理就是放在FastThreadLocal里）。
+// 在释放已分配的内存块时，不放回到 Chunk 中，而是缓存到 tcache 中。
+// 在分配内存块时，优先从 tcache 获取。无法获取到，再从 Chunk 中分配。
+// 通过这样的方式，尽可能的避免多线程的同步和竞争请求PoolArena的分配和释放内存。
+final class PoolThreadCache {
+
+	final PoolArena<byte[]> heapArena;
+	final PoolArena<ByteBuffer> directArena;
+
+	// Hold the caches for the different size classes, which are tiny, small and normal.
+	/**
+	 * Heap 类型的 tiny Subpage 内存块缓存数组
+	 */
+	private final MemoryRegionCache<byte[]>[] tinySubPageHeapCaches;
+	/**
+	 * Heap 类型的 small Subpage 内存块缓存数组
+	 */
+	private final MemoryRegionCache<byte[]>[] smallSubPageHeapCaches;
+	/**
+	 * Heap 类型的 normal 内存块缓存数组
+	 */
+	private final MemoryRegionCache<byte[]>[] normalHeapCaches;
+	/**
+	 * Direct 类型的 tiny Subpage 内存块缓存数组
+	 */
+	private final MemoryRegionCache<ByteBuffer>[] tinySubPageDirectCaches;
+	/**
+	 * Direct 类型的 small Subpage 内存块缓存数组
+	 */
+	private final MemoryRegionCache<ByteBuffer>[] smallSubPageDirectCaches;
+	/**
+	 * Direct 类型的 normal 内存块缓存数组
+	 */
+	private final MemoryRegionCache<ByteBuffer>[] normalDirectCaches;
+
+	// Used for bitshifting when calculate the index of normal caches later
+	/**
+	 * 用于计算请求分配的 normal 类型的内存块，在 {@link #normalDirectCaches} 数组中的位置
+	 *
+	 * 默认为 log2(pageSize) = log2(8192) = 13
+	 */
+	private final int numShiftsNormalDirect;
+	/**
+	 * 用于计算请求分配的 normal 类型的内存块，在 {@link #normalHeapCaches} 数组中的位置
+	 *
+	 * 默认为 log2(pageSize) = log2(8192) = 13
+	 */
+	private final int numShiftsNormalHeap;
+
+	/**
+	 * 分配次数
+	 */
+	private int allocations;
+	/**
+	 * {@link #allocations} 到达该阀值，释放缓存
+	 *  
+	 * 默认为 8192 次
+	 * 
+	 * @see #free()
+	 */
+	private final int freeSweepAllocationThreshold;
+
+	// 构造方法
+	PoolThreadCache(PoolArena<byte[]> heapArena, PoolArena<ByteBuffer> directArena,
+                    int tinyCacheSize, int smallCacheSize, int normalCacheSize,
+                    int maxCachedBufferCapacity, int freeSweepAllocationThreshold) {
+        this.freeSweepAllocationThreshold = freeSweepAllocationThreshold;
+        this.heapArena = heapArena;
+        this.directArena = directArena;
+        if (directArena != null) {
+            tinySubPageDirectCaches = createSubPageCaches(
+                    tinyCacheSize, PoolArena.numTinySubpagePools, SizeClass.Tiny);
+            smallSubPageDirectCaches = createSubPageCaches(
+                    smallCacheSize, directArena.numSmallSubpagePools, SizeClass.Small);
+
+            numShiftsNormalDirect = log2(directArena.pageSize);
+            normalDirectCaches = createNormalCaches(
+                    normalCacheSize, maxCachedBufferCapacity, directArena);
+
+            directArena.numThreadCaches.getAndIncrement();
+        } else {
+            // No directArea is configured so just null out all caches
+            tinySubPageDirectCaches = null;
+            smallSubPageDirectCaches = null;
+            normalDirectCaches = null;
+            numShiftsNormalDirect = -1;
+        }
+        if (heapArena != null) {
+            // Create the caches for the heap allocations
+            tinySubPageHeapCaches = createSubPageCaches(
+                    tinyCacheSize, PoolArena.numTinySubpagePools, SizeClass.Tiny);
+            smallSubPageHeapCaches = createSubPageCaches(
+                    smallCacheSize, heapArena.numSmallSubpagePools, SizeClass.Small);
+
+            numShiftsNormalHeap = log2(heapArena.pageSize);
+            normalHeapCaches = createNormalCaches(
+                    normalCacheSize, maxCachedBufferCapacity, heapArena);
+
+            heapArena.numThreadCaches.getAndIncrement();
+        } else {
+            // No heapArea is configured so just null out all caches
+            tinySubPageHeapCaches = null;
+            smallSubPageHeapCaches = null;
+            normalHeapCaches = null;
+            numShiftsNormalHeap = -1;
+        }
+    }
+
+    // tiny 类型，默认 cacheSize = PooledByteBufAllocator.DEFAULT_TINY_CACHE_SIZE = 512 , 
+    // numCaches = PoolArena.numTinySubpagePools = 512 >>> 4 = 32
+    
+	// small 类型，默认 cacheSize = PooledByteBufAllocator.DEFAULT_SMALL_CACHE_SIZE = 256 , 
+	// numCaches = pageSize - 9 = 13 - 9 = 4
+	private static <T> MemoryRegionCache<T>[] createSubPageCaches(int cacheSize, int numCaches, SizeClass sizeClass) {
+        MemoryRegionCache<T>[] cache = new MemoryRegionCache[numCaches];
+        for (int i = 0; i < cache.length; i++) {
+            cache[i] = new SubPageMemoryRegionCache<T>(cacheSize, sizeClass);
+        }
+        return cache;
+	}
+
+	// 被PoolArena.allocate里被调用
+	boolean allocateSmall(PoolArena<?> area, PooledByteBuf<?> buf, int reqCapacity, int normCapacity) {
+        return allocate(cacheForSmall(area, normCapacity), buf, reqCapacity);
+    }
+
+	private MemoryRegionCache<?> cacheForSmall(PoolArena<?> area, int normCapacity) {
+        int idx = PoolArena.smallIdx(normCapacity);
+        if (area.isDirect()) {
+            return cache(smallSubPageDirectCaches, idx);
+        }
+        return cache(smallSubPageHeapCaches, idx);
+    }
+
+    private boolean allocate(MemoryRegionCache<?> cache, PooledByteBuf buf, int reqCapacity) {
+    	// 分配内存块，并初始化到 MemoryRegionCache 中
+        boolean allocated = cache.allocate(buf, reqCapacity);
+        // 到达阀值，整理缓存
+        if (++ allocations >= freeSweepAllocationThreshold) {
+            allocations = 0;
+            trim();
+        }
+        // 返回是否分配成功
+        return allocated;
+    }
+
+    // 内存块缓存
+    private abstract static class MemoryRegionCache<T> {
+		/**
+	     * {@link #queue} 队列大小
+	     */
+	    private final int size;
+	    /**
+	     * 队列。里面存储内存块Entry
+	     */
+	    private final Queue<Entry<T>> queue;
+	    /**
+	     * 内存类型
+	     */
+	    private final SizeClass sizeClass;
+	    /**
+	     * 分配次数计数器
+	     */
+	    private int allocations;
+
+	    MemoryRegionCache(int size, SizeClass sizeClass) {
+	        this.size = MathUtil.safeFindNextPositivePowerOfTwo(size);
+	        // 类型为 MPSC( Multiple Producer Single Consumer ) 队列，即多个生产者单一消费者
+	        // 多个生产者，指的是多个线程，移除( 释放 )内存块出队列。
+			// 单个消费者，指的是单个线程，添加( 缓存 )内存块到队列。
+	        queue = PlatformDependent.newFixedMpscQueue(this.size);
+	        this.sizeClass = sizeClass;
+	    }
+
+	    public final boolean add(PoolChunk<T> chunk, long handle) {
+		    // 创建 Entry 对象, 存放chunk？
+		    Entry<T> entry = newEntry(chunk, handle);
+		    // 添加到队列
+		    boolean queued = queue.offer(entry);
+		    // 若添加失败，说明队列已满，回收 Entry 对象
+		    if (!queued) {
+		        // If it was not possible to cache the chunk, immediately recycle the entry
+		        entry.recycle();
+		    }
+
+		    return queued; // 是否添加成功
+		}
+
+	    static final class Entry<T> {
+            /**
+		     * Recycler 处理器，用于回收 Entry 对象
+		     */
+		    final Handle<Entry<?>> recyclerHandle;
+
+		    PoolChunk<T> chunk;
+		    /**
+		     * 内存块Entry在 PoolChunk 的位置
+		     */
+		    long handle = -1;
+
+		    void recycle() {
+		        // 置空
+		        chunk = null;
+		        handle = -1;
+		        // 回收 Entry 对象
+		        recyclerHandle.recycle(this);
+		    }
+        }
+    }
+
+    // MemoryRegionCache 的子类，负责分配和释放 tiny 和 small 的内存块
+    private static final class SubPageMemoryRegionCache<T> extends MemoryRegionCache<T> {
+    	@Override
+        protected void initBuf(
+                PoolChunk<T> chunk, long handle, PooledByteBuf<T> buf, int reqCapacity) {
+        	// 初始化内存块到 PooledByteBuf 对象中，因为这个子类只处理小型内存，所以用的是chunk里的subPage
+            chunk.initBufWithSubpage(buf, handle, reqCapacity);
         }
     }
 }
