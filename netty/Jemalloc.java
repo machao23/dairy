@@ -206,6 +206,22 @@ final class PoolChunk<T> implements PoolChunkMetric {
         updateParentsAlloc(id);
         return id;
     }
+
+    // 在PoolThreadCache 里 initBuf 时候 初始化 SubPage 内存块到 PooledByteBuf 中被调用
+    private void initBufWithSubpage(PooledByteBuf<T> buf, long handle, int bitmapIdx, int reqCapacity) {
+    	// 获得 memoryMap 数组的编号( 下标 ), 其实就是handle
+    	// 通过这个handle检索复用内存？
+        int memoryMapIdx = memoryMapIdx(handle);
+
+        PoolSubpage<T> subpage = subpages[subpageIdx(memoryMapIdx)];
+
+        // 初始化 SubPage 内存块到 PooledByteBuf 中
+        // 调用ByteBuf的init
+        buf.init(
+            this, handle,
+            runOffset(memoryMapIdx) + (bitmapIdx & 0x3FFFFFFF) * subpage.elemSize + offset,
+                reqCapacity, subpage.elemSize, arena.parent.threadCache());
+    }
 }
 
 // 虽然，PoolSubpage 类的命名是“Subpage”，实际描述的是，Page 切分为多个 Subpage 内存块的分配情况。
@@ -751,6 +767,7 @@ final class PoolThreadCache {
 		    PoolChunk<T> chunk;
 		    /**
 		     * 内存块Entry在 PoolChunk 的位置
+		     * 通过 chunk 和 handle 属性，可以唯一确认一个内存块。
 		     */
 		    long handle = -1;
 
