@@ -97,6 +97,8 @@ final class FluxTimeout<T, U, V> extends FluxOperator<T, T> {
 
 	static final class TimeoutMainSubscriber<T, V> extends Operators.MultiSubscriptionSubscriber<T, T> {
 		void handleTimeout() {
+			// 调用当前subscription的cancel
+			super.cancel();
 			// 触发主流程的subscriber的onError，结束主流程
 			actual.onError(new TimeoutException("Did not observe any item or terminal signal within "
 					+ timeoutDescription + " (and no fallback has been configured)"));
