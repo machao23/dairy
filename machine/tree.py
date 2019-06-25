@@ -56,8 +56,43 @@ def chooseBestFeatureToSplit(dataSet):
 	# 返回按哪个特征分组能获得最优熵的结果
     return bestFeature                      #returns an integer
 
+# 所有特征都无法确定分类情况下，使用投票决策
+def majorityCnt(classList):
+    classCount={}
+    for vote in classList:
+        if vote not in classCount.keys(): classCount[vote] = 0
+        classCount[vote] += 1
+    sortedClassCount = sorted(classCount.iteritems(), key=operator.itemgetter(1), reverse=True)
+    return sortedClassCount[0][0]
+
+# 创建决策树
+def createTree(dataSet,labels):
+    # classList就是所有的分类结果集合
+    classList = [example[-1] for example in dataSet]
+    # 如果遍历到了具体一个分类结果，就直接返回
+    if classList.count(classList[0]) == len(classList):
+        return classList[0]#stop splitting when all of the classes are equal
+    # 所有特征都不能决定出唯一的分类结果，就使用投票策略
+    if len(dataSet[0]) == 1: #stop splitting when there are no more features in dataSet
+        return majorityCnt(classList)
+	# 根据香农熵找到最佳切分的起始特征
+    bestFeat = chooseBestFeatureToSplit(dataSet)
+    # 根据下标找到特征的描述标签
+    bestFeatLabel = labels[bestFeat]
+    # 该特征作为树的节点
+    myTree = {bestFeatLabel:{}}
+	# 删除该特征，继续从其他特征决策树枝
+    del(labels[bestFeat])
+	# 列出最优熵的特征的枚举值
+    featValues = [example[bestFeat] for example in dataSet]
+    uniqueVals = set(featValues)
+	# 根据枚举值开始创建该特征节点下的树枝或树叶
+    for value in uniqueVals:
+        subLabels = labels[:]       #copy all of labels, so trees don't mess up existing labels
+        myTree[bestFeatLabel][value] = createTree(splitDataSet(dataSet, bestFeat, value),subLabels)
+    return myTree
+
 if __name__ == "__main__":
-        myDat,labels = createDataSet()
-        print(myDat)
-        ret = chooseBestFeatureToSplit(myDat)
-        print(ret)
+    myDat,labels=createDataSet()
+    myTree=createTree(myDat,labels)
+    print("myTree",myTree)
