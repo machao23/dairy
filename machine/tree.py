@@ -91,6 +91,21 @@ def createTree(dataSet,labels):
         subLabels = labels[:]       #copy all of labels, so trees don't mess up existing labels
         myTree[bestFeatLabel][value] = createTree(splitDataSet(dataSet, bestFeat, value),subLabels)
     return myTree
+	
+def classify(inputTree,featLabels,testVec):
+    # 找到树或子树的根节点
+    firstStr = inputTree.keys()[0]
+    # 根节点下的子树 dict类型
+    secondDict = inputTree[firstStr]
+    featIndex = featLabels.index(firstStr)
+    key = testVec[featIndex]
+    valueOfFeat = secondDict[key]
+	# 如果不是叶子节点就递归查找
+    if isinstance(valueOfFeat, dict):
+        classLabel = classify(valueOfFeat, featLabels, testVec)
+	# 是叶子节点就返回分类结果
+    else: classLabel = valueOfFeat
+    return classLabel
 
 if __name__ == "__main__":
     myDat,labels=createDataSet()
