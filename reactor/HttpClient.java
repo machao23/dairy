@@ -7,21 +7,17 @@ public class HttpClient implements NettyConnector<HttpClientResponse, HttpClient
 	// 构造方法
 	private HttpClient(HttpClient.Builder builder) {
 		HttpClientOptions.Builder clientOptionsBuilder = HttpClientOptions.builder();
-		if (Objects.nonNull(builder.options)) {
-			builder.options.accept(clientOptionsBuilder);
-		}
-		if (!clientOptionsBuilder.isLoopAvailable()) {
-			// 首次调用HttpResources.get初始化连接池，后续复用连接池
-			// 这里也可以看到调用的静态方法，涉及到全局共享
-			clientOptionsBuilder.loopResources(HttpResources.get());
-		}
-		if (!clientOptionsBuilder.isPoolAvailable() && !clientOptionsBuilder.isPoolDisabled()) {
-			clientOptionsBuilder.poolResources(HttpResources.get());
-		}
+		builder.options.accept(clientOptionsBuilder);
+		// 首次调用HttpResources.get初始化连接池，后续复用连接池
+		// 这里也可以看到调用的静态方法，涉及到全局共享，在TF里就是SR、CR和OTHER这3个HttpClient实例共享HttpResources
+		// 后续每次请求都会从poolResources里获取复用实例
+		clientOptionsBuilder.loopResources(HttpResources.get());
+		clientOptionsBuilder.poolResources(HttpResources.get());
 		this.options = clientOptionsBuilder.build();
 		this.client = new TcpBridgeClient(options);
 	}
 
+	// 发送Http请求
     public Mono<HttpClientResponse> request(HttpMethod method, String url,
 			Function<? super HttpClientRequest, ? extends Publisher<Void>> handler) {
 
@@ -30,14 +26,63 @@ public class HttpClient implements NettyConnector<HttpClientResponse, HttpClient
 	}
 
 	// HttpClient和TcpClient中间的bridge
-	final class TcpBridgeClient extends TcpClient implements
-	                                              BiConsumer<ChannelPipeline, ContextHandler<Channel>> {
+	final class TcpBridgeClient extends TcpClient implements BiConsumer<ChannelPipeline, ContextHandler<Channel>> {
 	}
 }
 
+// 所有HttpClient实例复用HttpResources
+public final class HttpResources extends TcpResources {
+	// 本质上就是一个工厂方法，创建一个单例HttpResources并复用
+	public static HttpResources get() {
+		// 实质是调用父类 TcpResources.getOrCreate
+		return getOrCreate(httpResources, null, null, ON_HTTP_NEW, "http");
+	}
+
+	// httpResources因为是static变量，所以是全局变量
+	// 表示httpResources是被所有httpClient共享的
+	static final AtomicReference<HttpResources>	httpResources;
+	static final BiFunction<LoopResources, PoolResources, HttpResources> ON_HTTP_NEW;
+	static {
+		ON_HTTP_NEW = HttpResources::new; // HttpResources的构造方法
+		httpResources = new AtomicReference<>();
+	}
+}
+
+public class TcpResources implements PoolResources, LoopResources {
+
+	// 全局变量 HttpResources 里获取 HttpResources实例变量，没有就创建 HttpResources 实例，也是static方法
+	protected static <T extends TcpResources> T getOrCreate(AtomicReference<T> ref, LoopResources loops, PoolResources pools,
+			BiFunction<LoopResources, PoolResources, T> onNew, String name) {
+		for (; ; ) {
+			// 静态变量 AtomicReference<HttpResources> 没有就创建，之后可以复用
+			T resources = ref.get();
+			if (resources == null || loops != null || pools != null) {
+				T update = create(resources, loops, pools, name, onNew);
+				if (ref.compareAndSet(resources, update)) {
+					return update;
+				}
+			}
+			else {
+				return resources;
+			}
+		}
+	}
+
+	// 创建一个HttpResources的实例变量，初始化属性PoolResources和LoopResources，并返回
+	static <T extends TcpResources> T create(T previous,
+			LoopResources loops,
+			PoolResources pools,
+			String name,
+			BiFunction<LoopResources, PoolResources, T> onNew) {
+		loops = loops == null ? LoopResources.create("reactor-" + name) : loops;
+		pools = pools == null ? PoolResources.elastic(name) : pools;
+		return onNew.apply(loops, pools);
+	}
+}
 // 一个HttpClient包含一个TcpClient的子类TcpBridgeClient
 public class TcpClient implements NettyConnector<NettyInbound, NettyOutbound> {
 
+	// 每次请求都会由MonoHttpClientResponse调用newHandler
 	protected Mono<? extends NettyContext> newHandler(BiFunction<? super NettyInbound, ? super NettyOutbound, ? extends Publisher<Void>> handler,
 			InetSocketAddress address,
 			boolean secure,
@@ -62,6 +107,7 @@ final class DefaultPoolResources implements PoolResources {
 			EventLoopGroup group) {
 		SocketAddressHolder holder = new SocketAddressHolder(remote);
 		for (; ; ) {
+			// 这里的映射检索，其实就是根据请求地址
 			Pool pool = channelPools.get(holder);
 			if (pool != null) {
 				return pool;
@@ -99,33 +145,5 @@ final class MonoHttpClientResponse extends Mono<HttpClientResponse> {
 		    .retry(bridge)
 		    .cast(HttpClientResponse.class)
 		    .subscribe(subscriber);
-	}
-}
-
-public final class HttpResources extends TcpResources {
-	public static HttpResources get() {
-		// 实质是调用父类 TcpResources.getOrCreate
-		return getOrCreate(httpResources, null, null, ON_HTTP_NEW, "http");
-	}
-
-	// httpResources因为是static变量，所以是全局变量
-	// 表示httpResources是被所有httpClient共享的
-	static final AtomicReference<HttpResources>	httpResources;
-	static {
-		httpResources = new AtomicReference<>();
-	}
-}
-
-public class TcpResources implements PoolResources, LoopResources {
-	protected static <T extends TcpResources> T getOrCreate(AtomicReference<T> ref,
-			LoopResources loops,
-			PoolResources pools,
-			BiFunction<LoopResources, PoolResources, T> onNew,
-			String name) {
-		T update;
-		for (; ; ) {
-			T resources = ref.get();
-			if (resources == null || loops != null || pools != null) {
-		}
 	}
 }
