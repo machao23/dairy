@@ -3,7 +3,6 @@ public abstract class Mono<T> implements Publisher<T> {
 	// 超时方法
 	public final Mono<T> timeout(Duration timeout, @Nullable Mono<? extends T> fallback, Scheduler timer) {
 		// 本质是通过Mono.delay来实现计时，
-		// 但为什么会触发onErrorReturn呢？
 		final Mono<Long> _timer = Mono.delay(timeout, timer).onErrorReturn(0L);
 		// 创建MonoTimeout实例
 		return onAssembly(new MonoTimeout<>(this, _timer, timeout.toMillis() + "ms"));
