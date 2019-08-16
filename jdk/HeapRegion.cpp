@@ -125,7 +125,6 @@ size_t G1CollectorPolicy::expansion_amount() {
     // G1ExpandByPercentOfAvailable % of the available expansion
     // space, whichever is smaller, bounded below by a minimum
     // expansion (unless that's all that's left.)
-	// 扩容下限 min_expand_bytes 是1M
     const size_t min_expand_bytes = 1*M;
     size_t reserved_bytes = _g1->max_capacity();
     size_t committed_bytes = _g1->capacity();
@@ -136,11 +135,40 @@ size_t G1CollectorPolicy::expansion_amount() {
       uncommitted_bytes * G1ExpandByPercentOfAvailable / 100;
 	// 与当前已分配的committed_bytes比较，作为扩容上限
     expand_bytes = MIN2(expand_bytes_via_pct, committed_bytes);
+	// 扩容下限 min_expand_bytes 是1M
     expand_bytes = MAX2(expand_bytes, min_expand_bytes);
     expand_bytes = MIN2(expand_bytes, uncommitted_bytes);
 
     return expand_bytes;
   } else {
     return 0;
+  }
+}
+
+class G1CollectorPolicy: public CollectorPolicy {
+  // 预测GC停顿时长，TruncatedSeq 截断序列，只跟踪序列中最新的n个元素
+  double get_new_prediction(TruncatedSeq* seq) {
+	// davg是衰减均值，sigma表示对近期历史数据的信赖度，dsd表示衰减标准偏差
+	// confidence_factor 补偿历史样本数据不足，信赖度的相关系数
+    return MAX2(seq->davg() + sigma() * seq->dsd(),
+                seq->davg() * confidence_factor(seq->num()));
+  }
+}
+
+
+// GC过程中每个可测量的步骤花费的时间都会记录到AbsSeq的子类 TruncatedSeq
+// 计算TruncatedSeq的衰减均值 davg，衰减方差 dvariance
+void AbsSeq::add(double val) 
+  if (_num == 0) {
+	// 初始状态没有历史数据，davg就是当前参数
+    // if the sequence is empty, the davg is the same as the value
+    _davg = val;
+    // and the variance is 0
+    _dvariance = 0.0;
+  } else {
+    // otherwise, calculate both
+    _davg = (1.0 - _alpha) * val + _alpha * _davg;
+    double diff = val - _davg;
+    _dvariance = (1.0 - _alpha) * diff * diff + _alpha * _dvariance;
   }
 }
