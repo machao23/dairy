@@ -473,7 +473,6 @@ HeapWord* G1CollectedHeap::mem_allocate(size_t word_size,
     VM_G1CollectForAllocation op(gc_count_before, word_size);
     // ...and get the VM thread to execute it.
     VMThread::execute(&op);
-    ..........................省略.............................
 }
 
 void ThreadLocalAllocBuffer::fill(HeapWord* start,
