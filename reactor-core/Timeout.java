@@ -31,11 +31,12 @@ final class MonoTimeout<T, U, V> extends MonoOperator<T, T> {
 		FluxTimeout.TimeoutTimeoutSubscriber ts =
 				new FluxTimeout.TimeoutTimeoutSubscriber(main, 0L);
 
-		main.setTimeout(ts);
 		// ts是订阅超时事件的subscriber
+		// firstTimeout 是下游 MonoOnErrorResume
 		firstTimeout.subscribe(ts);
 
 		// 每个中间publisher，都有下游身份，所以在subscribe的时候需要创建一个自己的subscriber来订阅上游souce
+		// source就是上游 MonoMapFuseable
 		source.subscribe(main);
 	}
 }

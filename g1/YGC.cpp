@@ -36,7 +36,7 @@ void G1RootProcessor::evacuate_roots(OopClosure* scan_non_heap_roots,
 
   // CodeBlobClosures are not interoperable with BufferingOopClosures
   G1CodeBlobClosure root_code_blobs(scan_non_heap_roots);
-  // 处理java roots
+  // 处理java roots，主要指类加载器和线程栈
   process_java_roots(strong_roots,
                      trace_metadata ? scan_strong_clds : NULL,
                      scan_strong_clds,
@@ -51,7 +51,7 @@ void G1RootProcessor::evacuate_roots(OopClosure* scan_non_heap_roots,
     worker_has_discovered_all_strong_classes();
   }
 
-  // 处理jvm roots
+  // 处理jvm roots，通常是JVM的全局对象
   process_vm_roots(strong_roots, weak_roots, phase_times, worker_i);
 
   {
