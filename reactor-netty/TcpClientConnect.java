@@ -77,6 +77,24 @@ public class SimpleChannelPool implements ChannelPool {
     protected boolean offerChannel(Channel channel) {
         return deque.offer(channel);
     }
+	
+	// 内部类，一个简单的连接池实现
+	public class SimpleChannelPool implements ChannelPool {
+		
+		// 构造方法
+		public SimpleChannelPool(Bootstrap bootstrap, final ChannelPoolHandler handler, ChannelHealthChecker healthCheck,
+                             boolean releaseHealthCheck, boolean lastRecentUsed) {
+			// Clone the original Bootstrap as we want to set our own handler
+			this.bootstrap = checkNotNull(bootstrap, "bootstrap").clone();
+			this.bootstrap.handler(new ChannelInitializer<Channel>() {
+				@Override
+				protected void initChannel(Channel ch) throws Exception {
+					// 创建连接后回调, handler就是PooledConnectionProvider的内部类Pool
+					handler.channelCreated(ch);
+				}
+			});
+		}
+	}
 }
 
 final class PooledConnectionProvider implements ConnectionProvider {
@@ -102,73 +120,74 @@ final class PooledConnectionProvider implements ConnectionProvider {
 		     pool.inactiveConnections.decrementAndGet();
 		 });
 	}
+	
+	final static class Pool extends AtomicBoolean
+			implements ChannelPoolHandler, ChannelPool, ChannelHealthChecker {
+				
+		// 连接创建后回调这个方法
+		@Override
+		public void channelCreated(Channel ch) {
 
-	@Override
-	public void run() {
-		Channel c = f.getNow();
-		pool.activeConnections.incrementAndGet();
-		pool.inactiveConnections.decrementAndGet();
+			inactiveConnections.incrementAndGet();
 
+			PooledConnection pooledConnection = new PooledConnection(ch, this);
 
-		ConnectionObserver current = c.attr(OWNER)
-		                              .getAndSet(this);
+			pooledConnection.bind();
 
-		if (current instanceof PendingConnectionObserver) {
-			PendingConnectionObserver pending = (PendingConnectionObserver)current;
-			PendingConnectionObserver.Pending p;
-			current = null;
-			registerClose(c, pool);
+			Bootstrap bootstrap = this.bootstrap.clone();
 
-			while((p = pending.pendingQueue.poll()) != null) {
-				if (p.error != null) {
-					onUncaughtException(p.connection, p.error);
-				}
-				else if (p.state != null) {
-					onStateChange(p.connection, p.state);
-				}
-			}
+			BootstrapHandlers.finalizeHandler(bootstrap, opsFactory, pooledConnection);
+			
+			// 这里就是往netty的channel的pipeline里添加内置的handler
+			// 最终会调用到 BootstrapInitializerHandler.initChannel, 添加内置的handler
+			ch.pipeline()
+			  .addFirst(bootstrap.config()
+			                     .handler());
 		}
-		else if (current == null) {
-			registerClose(c, pool);
-		}
+	}
+}
 
-
-		if (current != null) {
-			Connection conn = Connection.from(c);
-			if (log.isDebugEnabled()) {
-				log.debug(format(c, "Channel acquired, now {} active connections and {} inactive connections"),
-						pool.activeConnections, pool.inactiveConnections);
-			}
-			obs.onStateChange(conn, State.ACQUIRED);
-
-			PooledConnection con = conn.as(PooledConnection.class);
-			if (con != null) {
-				ChannelOperations<?, ?> ops = pool.opsFactory.create(con, con, null);
-				if (ops != null) {
-					ops.bind();
-					obs.onStateChange(ops, State.CONFIGURED);
-					sink.success(ops);
-				}
-				else {
-					//already configured, just forward the connection
-					sink.success(con);
+public abstract class BootstrapHandlers {
+	@ChannelHandler.Sharable
+	static final class BootstrapInitializerHandler extends ChannelInitializer<Channel> {
+		// 初始化连接，添加内置的handler到pipeline
+		@Override
+		protected void initChannel(Channel ch) {
+			if (pipeline != null) {
+				// pipeline默认是有3个pipelineConfiguration
+				// proxyHandler, HttpClientConnect.Http1Initializer, sslHandler
+				for (PipelineConfiguration pipelineConfiguration : pipeline) {
+					pipelineConfiguration.consumer.accept(listener, ch);
 				}
 			}
-			else {
-				//already bound, just forward the connection
-				sink.success(conn);
-			}
-			return;
-		}
-		//Connected, leave onStateChange forward the event if factory
 
-		if (log.isDebugEnabled()) {
-			log.debug(format(c, "Channel connected, now {} active " +
-							"connections and {} inactive connections"),
-					pool.activeConnections, pool.inactiveConnections);
+			ChannelOperations.addReactiveBridge(ch, opsFactory, listener);
 		}
-		if (pool.opsFactory == ChannelOperations.OnSetup.empty()) {
-			sink.success(Connection.from(c));
+	}
+}
+
+final class HttpClientConnect extends HttpClient {
+	static final class Http1Initializer
+			implements BiConsumer<ConnectionObserver, Channel>  {
+		@Override
+		public void accept(ConnectionObserver listener, Channel channel) {
+			channel.pipeline()
+			       .addLast(NettyPipeline.HttpCodec,
+			                new HttpClientCodec(decoder.maxInitialLineLength(),
+			                                    decoder.maxHeaderSize(),
+			                                    decoder.maxChunkSize(),
+			                                    decoder.failOnMissingResponse,
+			                                    decoder.validateHeaders(),
+			                                    decoder.initialBufferSize(),
+			                                    decoder.parseHttpAfterConnectRequest));
+
+			if (compress) {
+				// 如果要处理的返回报文是gzip的，就要添加 HttpContentDecompressor
+				channel.pipeline()
+				       .addAfter(NettyPipeline.HttpCodec,
+						       NettyPipeline.HttpDecompressor,
+						       new HttpContentDecompressor());
+			}
 		}
 	}
 }
