@@ -167,6 +167,33 @@ public abstract class BootstrapHandlers {
 }
 
 final class HttpClientConnect extends HttpClient {
+	
+	static final class MonoHttpConnect extends Mono<Connection> {
+		@Override
+		public void subscribe(CoreSubscriber<? super Connection> actual) {
+			Mono.<Connection>create(sink -> {
+				Bootstrap finalBootstrap;
+				//append secure handler if needed
+				// 如果是HTTPS还需要添加https的处理handler
+				if (handler.activeURI.isSecure()) {
+					if (sslProvider == null) {
+						//should not need to handle H2 case already checked outside of
+						// this callback
+						finalBootstrap = SslProvider.setBootstrap(b.clone(),
+								HttpClientSecure.DEFAULT_HTTP_SSL_PROVIDER);
+					}
+					else {
+						finalBootstrap = b.clone();
+					}
+				}
+
+				tcpClient.connect(finalBootstrap)
+				         .subscribe(new TcpClientSubscriber(sink));
+
+			}).retry(handler).subscribe(actual);
+		}
+	}
+	
 	static final class Http1Initializer
 			implements BiConsumer<ConnectionObserver, Channel>  {
 		@Override
