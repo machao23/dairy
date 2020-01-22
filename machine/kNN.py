@@ -18,13 +18,14 @@ from os import listdir
 
 # inX: 待分类的当前点
 # dataSet: 已知类别的训练样本集
-# labels: 已知类别的标签集？
+# labels: 已知类别的标签集
 # k：选择距离最近点的个数
 def classify0(inX, dataSet, labels, k):
 	# shape返回各个维度的个数，group.shape 返回 (4,2)，即4行2列
     dataSetSize = dataSet.shape[0] # 4
 	# 以下3行距离计算
 	# 使用欧式距离公式，计算已知类别数据集中的所有点与当前点之间的距离
+	# tile函数将变量内容复制成输入矩阵同样大小的矩阵
 	# 假设待分类的点坐标是[0,0] tile([0,0], (4,1)) = array([[0,0],[0,0],[0,0],[0,0]])
 	# 这样就和训练样本集的维度一致,可以做减法计算距离了
 	# diffMat = [[0-1, 0-1.1], [0-1, 0-1], [0-0, 0-0], [0-0, 0-1]] = [[-1,-1.1], [-1,-1], [0,0], [0,-0.1]]
@@ -79,27 +80,39 @@ def file2matrix(filename):
 	# classLabelVector 即每行的最后一个元素，即已知的类别: [3,2,1 ... ]
     return returnMat,classLabelVector
 
-    
+# 归一化特征值: new = (old - min) / (max - min)    
 def autoNorm(dataSet):
+	# min和value分别是每列的最小值和最大值
+	# min: [0, 0, 0.001156]
     minVals = dataSet.min(0)
     maxVals = dataSet.max(0)
     ranges = maxVals - minVals
+	# shape(dataSet) 返回矩阵的行数和个数，即(1000,3)
+	# normDataSet 就是个全0的和dataSet相同的矩阵
     normDataSet = zeros(shape(dataSet))
     m = dataSet.shape[0]
+	# minVals因为列数也是3，所以只需要tile复制m行得到的矩阵就和dataSet一样
+	# 分子: old - min
     normDataSet = dataSet - tile(minVals, (m,1))
     normDataSet = normDataSet/tile(ranges, (m,1))   #element wise divide
     return normDataSet, ranges, minVals
    
 def datingClassTest():
-    hoRatio = 0.50      #hold out 10%
+	# 10%的数据作为验证
+    hoRatio = 0.10      #hold out 10%
+	# 文件中读取数据转成矩阵
     datingDataMat,datingLabels = file2matrix('datingTestSet2.txt')       #load data setfrom file
+	# 归一化特征值
     normMat, ranges, minVals = autoNorm(datingDataMat)
     m = normMat.shape[0]
+	# 待验证的数据量：1000*0.1 = 100
     numTestVecs = int(m*hoRatio)
     errorCount = 0.0
     for i in range(numTestVecs):
+		# 执行函数classify0，根据后900行的样本，使用kNN算法轮询计算前100行的特征值
         classifierResult = classify0(normMat[i,:],normMat[numTestVecs:m,:],datingLabels[numTestVecs:m],3)
         print "the classifier came back with: %d, the real answer is: %d" % (classifierResult, datingLabels[i])
+		# 拿计算的结果和已知结果比较
         if (classifierResult != datingLabels[i]): errorCount += 1.0
     print "the total error rate is: %f" % (errorCount/float(numTestVecs))
     print errorCount
