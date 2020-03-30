@@ -296,6 +296,82 @@ func podFitsOnNode(
 	return len(failedPredicates) == 0, failedPredicates, nil
 }
 
+// PrioritizeNodes prioritizes the nodes by running the individual priority functions in parallel.
+// Each priority function is expected to set a score of 0-10
+// 0 is the lowest priority score (least preferred node) and 10 is the highest
+// Each priority function can also have its own weight
+// The node scores returned by the priority function are multiplied by the weights to get weighted scores
+// All scores are finally combined (added) to get the total weighted scores of all nodes
+func PrioritizeNodes(
+	pod *v1.Pod,
+	nodeNameToInfo map[string]*schedulercache.NodeInfo,
+	meta interface{},
+	priorityConfigs []algorithm.PriorityConfig,
+	nodes []*v1.Node,
+	extenders []algorithm.SchedulerExtender,
+	// 返回类型HostPriority这个struct的属性是Host和Score，这个结构保存的是一个node在一个priority算法计算后所得到的结果
+	// HostPriorityList这个结构是要保存一个算法作用于所有node之后，得到的所有node的Score信息的。
+) (schedulerapi.HostPriorityList, error) {
+
+	var (
+		mu   = sync.Mutex{}
+		wg   = sync.WaitGroup{}
+		errs []error
+	)
+
+	// results类型是[]schedulerapi.HostPriorityList，
+	// 它保存的是所有算法作用所有node之后得到的结果集，相当于一个二维数组，每个格子是1个算法
+	// 作用于1个节点的结果，一行也就是1个算法作用于所有节点的结果；一行展成一个二维就是所有算法作用于所有节点；
+	results := make([]schedulerapi.HostPriorityList, len(priorityConfigs), len(priorityConfigs))
+
+	// priorityConfigs包含了name，weight，PriorityFunction这些属性
+	for i := range priorityConfigs {
+		if priorityConfigs[i].Function != nil {
+			// 老方法，没有实现Map-Reduce,直接调用Function属性
+			wg.Add(1)
+			go func(index int) {
+				defer wg.Done()
+				// 结果保存在results的index下标里
+				results[index], err = priorityConfigs[index].Function(pod, nodeNameToInfo, nodes)
+			}(i)
+		} else {
+			// 如果没有定义Function，其实也就是使用了Map-Reduce方式的，这里先存个空的结构占位；
+			results[i] = make(schedulerapi.HostPriorityList, len(nodes))
+		}
+	}
+
+	workqueue.ParallelizeUntil(context.TODO(), 16, len(nodes), func(index int) {
+		// 这里的index是[0，len(nodes)-1]，相当于遍历所有的nodes；
+		nodeInfo := nodeNameToInfo[nodes[index].Name]
+		// 这个for循环遍历的是所有的优选配置，如果有老Fun就跳过，新逻辑Map-Reduce就继续；
+		for i := range priorityConfigs {
+			if priorityConfigs[i].Function != nil {
+				// 因为前面old已经运行过了
+				continue
+			}
+			results[i][index], err = priorityConfigs[i].Map(pod, meta, nodeInfo)
+		}
+	})
+
+	for i := range priorityConfigs {
+		wg.Add(1)
+		go func(index int) {
+			defer wg.Done()
+			// 调用Reduce函数
+			priorityConfigs[index].Reduce(pod, meta, nodeNameToInfo, results[index])
+		}(i)
+	}
+	// Wait for all computations to be finished.
+	wg.Wait()
+
+	// Summarize all scores.
+	// 对node粒度聚合每个Priority算法的score
+	// 要将前面得到的二维结果results压缩成一维的加权分值集合result，最终返回这个result
+	result := make(schedulerapi.HostPriorityList, 0, len(nodes))
+	...
+	return result, nil
+}
+
 // ----------------------------------------------------------------
 // pkg/scheduler/algorithm/predicates/predicates.go
 
