@@ -103,6 +103,16 @@ func (sched *Scheduler) scheduleOne() {
 
 	// 计算合适的node
 	suggestedHost, err := sched.schedule(pod)
+	if err != nil {
+		// 当schedule()函数没有返回 host，也就是没有找到合适的 node 的时候，就会触发 preempt 过程
+		// schedule() may have failed because the pod would not fit on any host, so we try to
+		// preempt, with the expectation that the next time the pod is tried for scheduling it
+		// will fit due to the preemption. It is also possible that a different pod will schedule
+		// into the resources that were preempted, but this is harmless.
+		sched.preempt(pod, fitError)
+
+		return
+	}
 	// Tell the cache to assume that a pod now is running on a given node, even though it hasn't been bound yet.
 	// This allows us to keep scheduling without waiting on binding to occur.
 	assumedPod := pod.DeepCopy()
@@ -127,6 +137,46 @@ func (sched *Scheduler) schedule(pod *v1.Pod) (string, error) {
 	// 给定pod和nodes，计算出一个适合跑pod的node并返回
 	host, err := sched.config.Algorithm.Schedule(pod, sched.config.NodeLister)
 	return host, err
+}
+
+// schedule的结果没有合适的node，就调用preempt抢占
+// preempt tries to create room for a pod that has failed to schedule, by preempting lower priority pods if possible.
+// If it succeeds, it adds the name of the node where preemption has happened to the pod annotations.
+// It returns the node name and an error if any.
+func (sched *Scheduler) preempt(preemptor *v1.Pod, scheduleErr error) (string, error) {
+	// 更新pod信息
+	preemptor, err := sched.config.PodPreemptor.GetUpdatedPod(preemptor)
+
+	node, victims, nominatedPodsToClear, err := sched.config.Algorithm.Preempt(preemptor, sched.config.NodeLister, scheduleErr)
+
+	var nodeName = ""
+	if node != nil {
+		nodeName = node.Name
+		// SchedulingQueue 表示的是一个存储待调度 pod 的队列，
+		// 2种实现：FIFO先进先出和PriorityQueue优先级队列
+		// 更新队列中“任命pod”队列
+		// Update the scheduling queue with the nominated pod information. Without
+		// this, there would be a race condition between the next scheduling cycle
+		// and the time the scheduler receives a Pod Update for the nominated pod.
+		sched.config.SchedulingQueue.UpdateNominatedPodForNode(preemptor, nodeName)
+
+		// 设置pod的Status.NominatedNodeName
+		// Make a call to update nominated node name of the pod on the API server.
+		err = sched.config.PodPreemptor.SetNominatedNodeName(preemptor, nodeName)
+
+		for _, victim := range victims {
+			// 将要驱逐的 pod 驱逐
+			sched.config.PodPreemptor.DeletePod(victim); err != nil {
+		}
+	}
+	// Clearing nominated pods should happen outside of "if node != nil". Node could
+	// be nil when a pod with nominated node name is eligible to preempt again,
+	// but preemption logic does not find any node for it. In that case Preempt()
+	// function of generic_scheduler.go returns the pod itself for removal of the annotation.
+	for _, p := range nominatedPodsToClear {
+		sched.config.PodPreemptor.RemoveNominatedNodeName(p)
+	}
+	return nodeName, err
 }
 
 // pkg/scheduler/core/generic_scheduler.go
@@ -433,4 +483,44 @@ func ParallelizeUntil(ctx context.Context, workers, pieces int, doWorkPiece DoWo
 	}
 	// 阻塞等待16个goroutine都处理完
 	wg.Wait()
+}
+
+// ----------------------------------------------------------------
+// pkg/scheduler/internal/queue/scheduling_queue.go
+
+// 优先级队列的实现
+// PriorityQueue implements a scheduling queue. It is an alternative to FIFO.
+// The head of PriorityQueue is the highest priority pending pod. This structure
+// has two sub queues. One sub-queue holds pods that are being considered for
+// scheduling. This is called activeQ and is a Heap. Another queue holds
+// pods that are already tried and are determined to be unschedulable. The latter
+// is called unschedulableQ.
+type PriorityQueue struct {
+	stop  <-chan struct{}
+	clock util.Clock
+	lock  sync.RWMutex
+	cond  sync.Cond
+
+	// heap 头节点存的是最高优先级的 pod
+	// activeQ is heap structure that scheduler actively looks at to find pods to
+	// schedule. Head of heap is the highest priority pod.
+	activeQ *Heap
+	// unschedulableQ holds pods that have been tried and determined unschedulable.
+	unschedulableQ *UnschedulablePodsMap
+	// 存储已经被指定好要跑在某个 node 的 pod
+	// nominatedPods is a structures that stores pods which are nominated to run
+	// on nodes.
+	nominatedPods *nominatedPodMap
+	// schedulingCycle represents sequence number of scheduling cycle and is incremented
+	// when a pod is popped.
+	schedulingCycle int64
+	// moveRequestCycle caches the sequence number of scheduling cycle when we
+	// received a move request. Unscheduable pods in and before this scheduling
+	// cycle will be put back to activeQueue if we were trying to schedule them
+	// when we received move request.
+	moveRequestCycle int64
+
+	// closed indicates that the queue is closed.
+	// It is mainly used to let Pop() exit its control loop while waiting for an item.
+	closed bool
 }
