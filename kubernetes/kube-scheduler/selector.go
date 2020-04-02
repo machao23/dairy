@@ -224,31 +224,98 @@ func NodeSelectorRequirementsAsSelector(nsm []v1.NodeSelectorRequirement) (label
 
 // Fields表达式匹配
 func NodeSelectorRequirementsAsFieldSelector(nsm []v1.NodeSelectorRequirement) (fields.Selector, error) {
-	if len(nsm) == 0 {
-		return fields.Nothing(), nil
-	}
-
 	selectors := []fields.Selector{}
 	for _, expr := range nsm {
 		switch expr.Operator {
 		case v1.NodeSelectorOpIn:
-			if len(expr.Values) != 1 {
-				return nil, fmt.Errorf("unexpected number of value (%d) for node field selector operator %q",
-					len(expr.Values), expr.Operator)
-			}
 			selectors = append(selectors, fields.OneTermEqualSelector(expr.Key, expr.Values[0]))
 
 		case v1.NodeSelectorOpNotIn:
-			if len(expr.Values) != 1 {
-				return nil, fmt.Errorf("unexpected number of value (%d) for node field selector operator %q",
-					len(expr.Values), expr.Operator)
-			}
 			selectors = append(selectors, fields.OneTermNotEqualSelector(expr.Key, expr.Values[0]))
-
-		default:
-			return nil, fmt.Errorf("%q is not a valid node field selector operator", expr.Operator)
-		}
 	}
 
 	return fields.AndSelectors(selectors...), nil
+}
+
+// pkg/scheduler/algorithm/priorities/node_affinity.go
+
+// 软Node亲和匹配
+// 对潜在被调度Node的labels进行Match匹配检测，如果匹配则将条件所给定的Weight权重值累计。 最后将返回各潜在的被调度Node最后分值。
+func CalculateNodeAffinityPriorityMap(pod *v1.Pod, meta interface{}, nodeInfo *schedulercache.NodeInfo) (schedulerapi.HostPriority, error) {
+	node := nodeInfo.Node()
+	// 默认为Spec配置的Affinity
+	affinity := pod.Spec.Affinity
+	if priorityMeta, ok := meta.(*priorityMetadata); ok {
+		// We were able to parse metadata, use affinity from there.
+		affinity = priorityMeta.affinity
+	}
+
+	var count int32
+	if affinity != nil && affinity.NodeAffinity != nil && affinity.NodeAffinity.PreferredDuringSchedulingIgnoredDuringExecution != nil {
+		// 遍历PreferredDuringSchedulingIgnoredDuringExecution定义的`必要条件项`(Terms)
+		for i := range affinity.NodeAffinity.PreferredDuringSchedulingIgnoredDuringExecution {
+			preferredSchedulingTerm := &affinity.NodeAffinity.PreferredDuringSchedulingIgnoredDuringExecution[i]
+			// 如果weight为0则不做任何处理
+			if preferredSchedulingTerm.Weight == 0 {
+				continue
+			}
+			// 获取node亲和MatchExpression表达式条件
+			nodeSelector, err := v1helper.NodeSelectorRequirementsAsSelector(preferredSchedulingTerm.Preference.MatchExpressions)
+			if nodeSelector.Matches(labels.Set(node.Labels)) {
+				count += preferredSchedulingTerm.Weight
+			}
+		}
+	}
+	// 返回Node和得分
+	return schedulerapi.HostPriority{
+		Host:  node.Name,
+		Score: int(count),
+	}, nil
+}
+
+// 将各个node的最后得分重新计算分布区间在0〜10.
+// 代码内给定一个NormalizeReduce()方法，MaxPriority值为10,reverse取反false关闭
+var CalculateNodeAffinityPriorityReduce = NormalizeReduce(schedulerapi.MaxPriority, false)
+
+// pkg/scheduler/algorithm/priorities/reduce.go
+
+// 结果评分取值0〜MaxPriority
+// reverse取反为true时，最终评分=(MaxPriority-其原评分值）
+func NormalizeReduce(maxPriority int, reverse bool) algorithm.PriorityReduceFunction {
+	return func(
+		_ *v1.Pod,
+		_ interface{},
+		_ map[string]*schedulercache.NodeInfo,
+		result schedulerapi.HostPriorityList) error {
+
+		var maxCount int
+		for i := range result {
+			if result[i].Score > maxCount {
+				maxCount = result[i].Score
+			}
+		}
+
+		// 如果最大的值为0，且取反设为真，则将所有的评分设置为MaxPriority
+		if maxCount == 0 {
+			if reverse {
+				for i := range result {
+					result[i].Score = maxPriority
+				}
+			}
+			return nil
+		}
+
+		for i := range result {
+			score := result[i].Score
+			// 计算后得分 = maxPrority * 原分值 / 最大值
+			score = maxPriority * score / maxCount
+			if reverse {
+				// 如果取反为真则 maxPrority - 计算后得分
+				score = maxPriority - score
+			}
+
+			result[i].Score = score
+		}
+		return nil
+	}
 }
