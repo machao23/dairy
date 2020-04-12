@@ -160,6 +160,199 @@ func nodeMatchesNodeSelectorTerms(node *v1.Node, nodeSelectorTerms []v1.NodeSele
 	return v1helper.MatchNodeSelectorTerms(nodeSelectorTerms, labels.Set(node.Labels), fields.Set(nodeFields))
 }
 
+// pod亲和性检查
+func NewPodAffinityPredicate(info NodeInfo, podLister algorithm.PodLister) algorithm.FitPredicate {
+	checker := &PodAffinityChecker{
+		info:      info,
+		podLister: podLister,
+	}
+	return checker.InterPodAffinityMatches
+}
+
+// 被PodAffinityChecker调用，检查pod亲和性
+func (c *PodAffinityChecker) InterPodAffinityMatches(pod *v1.Pod, meta algorithm.PredicateMetadata, nodeInfo *schedulercache.NodeInfo) (bool, []algorithm.PredicateFailureReason, error) {
+	node := nodeInfo.Node()
+
+	//  检测当pod被调度到目标node上是否触犯了其它pods所定义的反亲和配置. 
+	// 即：当调度一个pod到目标Node上，而某个或某些Pod定义了反亲和配置与被 调度的Pod相匹配(触犯)，那么就不应该将此Node加入到可选的潜在调度Nodes列表内.
+	if failedPredicates, error := c.satisfiesExistingPodsAntiAffinity(pod, meta, nodeInfo); 
+
+	// Now check if <pod> requirements will be satisfied on this node.
+	// pod亲和性检查
+	affinity := pod.Spec.Affinity
+	if affinity == nil || (affinity.PodAffinity == nil && affinity.PodAntiAffinity == nil) {
+		// 没有配置亲和性，返回成功
+		return true, nil, nil
+	}
+
+	// 满足Pods亲和与反亲和配置
+	if failedPredicates, error := c.satisfiesPodsAffinityAntiAffinity(pod, meta, nodeInfo, affinity); 
+
+	return true, nil, nil
+}
+
+// 被 InterPodAffinityMatches 调用
+func (c *PodAffinityChecker) satisfiesExistingPodsAntiAffinity(pod *v1.Pod, meta algorithm.PredicateMetadata, nodeInfo *schedulercache.NodeInfo) (algorithm.PredicateFailureReason, error) {
+	node := nodeInfo.Node()
+
+	var topologyMaps *topologyPairsMaps
+
+	//  过滤掉pod的nodeName等于NodeInfo.Node.Name,且不存在于nodeinfo中.
+    //  即运行在其它Nodes上的Pods，只看这个node上其他的pods
+	// Filter out pods whose nodeName is equal to nodeInfo.node.Name, but are not
+	// present in nodeInfo. Pods on other nodes pass the filter.
+	filteredPods, err := c.podLister.FilteredList(nodeInfo.Filter, labels.Everything())
+
+	// 获取被调度Pod与其它存在反亲和配置的Pods匹配的topologyMaps
+	if topologyMaps, err = c.getMatchingAntiAffinityTopologyPairsOfPods(pod, filteredPods);
+	
+	// 遍历所有topology pairs(所有反亲和topologyKey/Value)，检测Node是否有影响.
+	// Iterate over topology pairs to get any of the pods being affected by
+	// the scheduled pod anti-affinity terms
+	for topologyKey, topologyValue := range node.Labels {
+		if topologyMaps.topologyPairToPods[topologyPair{key: topologyKey, value: topologyValue}] != nil {
+			klog.V(10).Infof("Cannot schedule pod %+v onto node %v", podName(pod), node.Name)
+			return ErrExistingPodsAntiAffinityRulesNotMatch, nil
+		}
+	}
+
+	return nil, nil
+}
+
+// 被satisfiesExistingPodsAntiAffinity调用，获取被调度Pod与其它存在反亲和配置的Pods匹配的topologyMaps
+func (c *PodAffinityChecker) getMatchingAntiAffinityTopologyPairsOfPods(pod *v1.Pod, existingPods []*v1.Pod) (*topologyPairsMaps, error) {
+	topologyMaps := newTopologyPairsMaps()
+
+	for _, existingPod := range existingPods {
+		// 遍历所有存在Pods,获取pod所运行的Node信息
+		existingPodNode, err := c.info.GetNodeInfo(existingPod.Spec.NodeName)
+		// 依据被调度的pod、目标pod、目标Node信息(上面获取得到)获取TopologyPairs。
+		existingPodTopologyMaps, err := getMatchingAntiAffinityTopologyPairsOfPod(pod, existingPod, existingPodNode)
+
+		topologyMaps.appendMaps(existingPodTopologyMaps)
+	}
+	return topologyMaps, nil
+}
+
+// 被 getMatchingAntiAffinityTopologyPairsOfPods 调用
+//1)是否ExistingPod定义了反亲和配置，如果没有直接返回
+//2)如果有定义，是否有任务一个反亲和Term匹配需被调度的pod.
+//  如果配置则将返回term定义的TopologyKey和Node的topologyValue.
+// getMatchingAntiAffinityTopologyPairs calculates the following for "existingPod" on given node:
+// (1) Whether it has PodAntiAffinity
+// (2) Whether ANY AffinityTerm matches the incoming pod
+func getMatchingAntiAffinityTopologyPairsOfPod(newPod *v1.Pod, existingPod *v1.Pod, node *v1.Node) (*topologyPairsMaps, error) {
+	affinity := existingPod.Spec.Affinity
+
+	topologyMaps := newTopologyPairsMaps()
+	for _, term := range GetPodAntiAffinityTerms(affinity.PodAntiAffinity) {
+		namespaces := priorityutil.GetNamespacesFromPodAffinityTerm(existingPod, &term)
+		selector, err := metav1.LabelSelectorAsSelector(term.LabelSelector)
+
+		if priorityutil.PodMatchesTermsNamespaceAndSelector(newPod, namespaces, selector) {
+			if topologyValue, ok := node.Labels[term.TopologyKey]; ok {
+				pair := topologyPair{key: term.TopologyKey, value: topologyValue}
+				topologyMaps.addTopologyPair(pair, existingPod)
+			}
+		}
+	}
+	return topologyMaps, nil
+}
+
+// 被 InterPodAffinityMatches 调用
+// Checks if scheduling the pod onto this node would break any term of this pod.
+func (c *PodAffinityChecker) satisfiesPodsAffinityAntiAffinity(pod *v1.Pod,
+	meta algorithm.PredicateMetadata, nodeInfo *schedulercache.NodeInfo,
+	affinity *v1.Affinity) (algorithm.PredicateFailureReason, error) {
+	node := nodeInfo.Node()
+	// 通过指定podFilter过滤器获取满足条件的pod列表
+	filteredPods, err := c.podLister.FilteredList(nodeInfo.Filter, labels.Everything())
+	//获取亲和、反亲和配置定义的"匹配条件"Terms
+	affinityTerms := GetPodAffinityTerms(affinity.PodAffinity)
+	antiAffinityTerms := GetPodAntiAffinityTerms(affinity.PodAntiAffinity)
+	matchFound, termsSelectorMatchFound := false, false
+	for _, targetPod := range filteredPods {
+		// 遍历所有目标Pod,检测所有亲和性配置"匹配条件"Terms
+		// Check all affinity terms.
+		if !matchFound && len(affinityTerms) > 0 {
+			// podMatchesPodAffinityTerms()对namespaces和标签条件表达式进行匹配目标pod
+			affTermsMatch, termsSelectorMatch, err := c.podMatchesPodAffinityTerms(pod, targetPod, nodeInfo, affinityTerms)
+	
+			if termsSelectorMatch {
+				termsSelectorMatchFound = true
+			}
+			if affTermsMatch {
+				matchFound = true
+			}
+		}
+		// 同上，遍历所有目标Pod,检测所有Anti反亲和配置"匹配条件"Terms.
+		// Check all anti-affinity terms.
+		if len(antiAffinityTerms) > 0 {
+			antiAffTermsMatch, _, err := c.podMatchesPodAffinityTerms(pod, targetPod, nodeInfo, antiAffinityTerms)
+			if err != nil || antiAffTermsMatch {
+				klog.V(10).Infof("Cannot schedule pod %+v onto node %v, because of PodAntiAffinityTerm, err: %v",
+					podName(pod), node.Name, err)
+				return ErrPodAntiAffinityRulesNotMatch, nil
+			}
+		}
+	}
+
+	if !matchFound && len(affinityTerms) > 0 {
+		// We have not been able to find any matches for the pod's affinity terms.
+		// This pod may be the first pod in a series that have affinity to themselves. In order
+		// to not leave such pods in pending state forever, we check that if no other pod
+		// in the cluster matches the namespace and selector of this pod and the pod matches
+		// its own terms, then we allow the pod to pass the affinity check.
+		if termsSelectorMatchFound {
+			klog.V(10).Infof("Cannot schedule pod %+v onto node %v, because of PodAffinity",
+				podName(pod), node.Name)
+			return ErrPodAffinityRulesNotMatch, nil
+		}
+		// Check if pod matches its own affinity properties (namespace and label selector).
+		if !targetPodMatchesAffinityOfPod(pod, pod) {
+			klog.V(10).Infof("Cannot schedule pod %+v onto node %v, because of PodAffinity",
+				podName(pod), node.Name)
+			return ErrPodAffinityRulesNotMatch, nil
+		}
+	}
+	
+	return nil, nil
+}
+
+// 被 satisfiesPodsAffinityAntiAffinity 调用
+// 通过获取亲和配置定义的所有namespaces和标签条件表达式进行匹配目标pod,
+// 完全符合则获取此目标pod的运行node的topologykey（此为affinity指定的topologykey）的值和潜在Node的topologykey的值比对是否一致.
+// podMatchesPodAffinityTerms checks if the "targetPod" matches the given "terms"
+// of the "pod" on the given "nodeInfo".Node(). It returns three values: 1) whether
+// targetPod matches all the terms and their topologies, 2) whether targetPod
+// matches all the terms label selector and namespaces (AKA term properties),
+// 3) any error.
+func (c *PodAffinityChecker) podMatchesPodAffinityTerms(pod, targetPod *v1.Pod, nodeInfo *schedulercache.NodeInfo, terms []v1.PodAffinityTerm) (bool, bool, error) {
+	// 获取{namespaces,selector}列表
+	props, err := getAffinityTermProperties(pod, terms)
+
+	// 匹配目标pod是否在affinityTerm定义的{namespaces,selector}列表内所有项，如果不匹配则返回false,
+	if !podMatchesAllAffinityTermProperties(targetPod, props) {
+		return false, false, nil
+	}
+	// 如果匹配则获取此pod的运行node信息(称为目标Node)，
+	// Namespace and selector of the terms have matched. Now we check topology of the terms.
+	targetPodNode, err := c.info.GetNodeInfo(targetPod.Spec.NodeName)
+
+	// 通过“目标Node”所定义的topologykey（此为affinity指定的topologykey）的值来匹配“潜在被调度的Node”的topologykey是否一致
+	for _, term := range terms {
+		if len(term.TopologyKey) == 0 {
+			return false, false, fmt.Errorf("empty topologyKey is not allowed except for PreferredDuringScheduling pod anti-affinity")
+		}
+
+		// 判断两者的topologyKey定义的值是否一致。
+		if !priorityutil.NodesHaveSameTopologyKey(nodeInfo.Node(), targetPodNode, term.TopologyKey) {
+			return false, true, nil
+		}
+	}
+	return true, true, nil
+}
+
 // pkg/apis/core/v1/helper/helper.go
 
 // matchExpressions”定义检测(匹配key与value)
