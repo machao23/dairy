@@ -512,3 +512,142 @@ func NormalizeReduce(maxPriority int, reverse bool) algorithm.PriorityReduceFunc
 		return nil
 	}
 }
+
+// pkg/scheduler/algorithm/priorities/interpod_affinity.go
+
+// CalculateInterPodAffinityPriority() 基于pod亲和性配置匹配"必要条件项”Terms,并发处理所有目标nodes,为其目标node统计亲和weight得分. 
+// CalculateInterPodAffinityPriority compute a sum by iterating through the elements of weightedPodAffinityTerm and adding
+// "weight" to the sum if the corresponding PodAffinityTerm is satisfied for
+// that node; the node(s) with the highest sum are the most preferred.
+// Symmetry need to be considered for preferredDuringSchedulingIgnoredDuringExecution from podAffinity & podAntiAffinity,
+// symmetry need to be considered for hard requirements from podAffinity
+func (ipa *InterPodAffinity) CalculateInterPodAffinityPriority(pod *v1.Pod, nodeNameToInfo map[string]*schedulercache.NodeInfo, nodes []*v1.Node) (schedulerapi.HostPriorityList, error) {
+	//"需被调度Pod"是否存在亲和、反亲和约束配置
+	affinity := pod.Spec.Affinity
+	hasAffinityConstraints := affinity != nil && affinity.PodAffinity != nil
+	hasAntiAffinityConstraints := affinity != nil && affinity.PodAntiAffinity != nil
+
+	allNodeNames := make([]string, 0, len(nodeNameToInfo))
+	for name := range nodeNameToInfo {
+		allNodeNames = append(allNodeNames, name)
+	}
+
+	// priorityMap stores the mapping from node name to so-far computed score of
+	// the node.
+	pm := newPodAffinityPriorityMap(nodes)
+	// processPod()主要处理pod亲和和反亲和weight累计的逻辑代码。 
+	// 这里只是定义processPod这个函数，具体调用在后面
+	processPod := func(existingPod *v1.Pod) error {
+		existingPodNode, err := ipa.info.GetNodeInfo(existingPod.Spec.NodeName)
+		existingPodAffinity := existingPod.Spec.Affinity
+		existingHasAffinityConstraints := existingPodAffinity != nil && existingPodAffinity.PodAffinity != nil
+		existingHasAntiAffinityConstraints := existingPodAffinity != nil && existingPodAffinity.PodAntiAffinity != nil
+
+		if hasAffinityConstraints {
+			// For every soft pod affinity term of <pod>, if <existingPod> matches the term,
+			// increment <pm.counts> for every node in the cluster with the same <term.TopologyKey>
+			// value as that of <existingPods>`s node by the term`s weight.
+			terms := affinity.PodAffinity.PreferredDuringSchedulingIgnoredDuringExecution
+			// 亲和性检测逻辑代码
+			pm.processTerms(terms, pod, existingPod, existingPodNode, 1)
+		}
+		if hasAntiAffinityConstraints {
+			// For every soft pod anti-affinity term of <pod>, if <existingPod> matches the term,
+			// decrement <pm.counts> for every node in the cluster with the same <term.TopologyKey>
+			// value as that of <existingPod>`s node by the term`s weight.
+			terms := affinity.PodAntiAffinity.PreferredDuringSchedulingIgnoredDuringExecution
+			pm.processTerms(terms, pod, existingPod, existingPodNode, -1)
+		}
+
+		if existingHasAffinityConstraints {
+			// For every hard pod affinity term of <existingPod>, if <pod> matches the term,
+			// increment <pm.counts> for every node in the cluster with the same <term.TopologyKey>
+			// value as that of <existingPod>'s node by the constant <ipa.hardPodAffinityWeight>
+			if ipa.hardPodAffinityWeight > 0 {
+				terms := existingPodAffinity.PodAffinity.RequiredDuringSchedulingIgnoredDuringExecution
+				// TODO: Uncomment this block when implement RequiredDuringSchedulingRequiredDuringExecution.
+				//if len(existingPodAffinity.PodAffinity.RequiredDuringSchedulingRequiredDuringExecution) != 0 {
+				//	terms = append(terms, existingPodAffinity.PodAffinity.RequiredDuringSchedulingRequiredDuringExecution...)
+				//}
+				for _, term := range terms {
+					pm.processTerm(&term, existingPod, pod, existingPodNode, float64(ipa.hardPodAffinityWeight))
+				}
+			}
+			// For every soft pod affinity term of <existingPod>, if <pod> matches the term,
+			// increment <pm.counts> for every node in the cluster with the same <term.TopologyKey>
+			// value as that of <existingPod>'s node by the term's weight.
+			terms := existingPodAffinity.PodAffinity.PreferredDuringSchedulingIgnoredDuringExecution
+			pm.processTerms(terms, existingPod, pod, existingPodNode, 1)
+		}
+		if existingHasAntiAffinityConstraints {
+			// For every soft pod anti-affinity term of <existingPod>, if <pod> matches the term,
+			// decrement <pm.counts> for every node in the cluster with the same <term.TopologyKey>
+			// value as that of <existingPod>'s node by the term's weight.
+			terms := existingPodAffinity.PodAntiAffinity.PreferredDuringSchedulingIgnoredDuringExecution
+			pm.processTerms(terms, existingPod, pod, existingPodNode, -1)
+		}
+		return nil
+	}
+
+	//ProcessNode()通过一个判断是否存在亲和性配置选择调用之前定义的processPod()
+	processNode := func(i int) {
+		nodeInfo := nodeNameToInfo[allNodeNames[i]]
+		if nodeInfo.Node() != nil {
+			if hasAffinityConstraints || hasAntiAffinityConstraints {
+				// We need to process all the nodes.
+				for _, existingPod := range nodeInfo.Pods() {
+					// 
+					if err := processPod(existingPod); err != nil {
+						pm.setError(err)
+					}
+				}
+			} else {
+				// The pod doesn't have any constraints - we need to check only existing
+				// ones that have some.
+				for _, existingPod := range nodeInfo.PodsWithAffinity() {
+					if err := processPod(existingPod); err != nil {
+						pm.setError(err)
+					}
+				}
+			}
+		}
+	}
+
+	// 并发多线程处理调用ProcessNode()
+	workqueue.ParallelizeUntil(context.TODO(), 16, len(allNodeNames), processNode)
+	if pm.firstError != nil {
+		return nil, pm.firstError
+	}
+
+	for _, node := range nodes {
+		if pm.counts[node.Name] > maxCount {
+			maxCount = pm.counts[node.Name]
+		}
+		if pm.counts[node.Name] < minCount {
+			minCount = pm.counts[node.Name]
+		}
+	}
+
+	// calculate final priority score for each node
+	result := make(schedulerapi.HostPriorityList, 0, len(nodes))
+	for _, node := range nodes {
+		fScore := float64(0)
+		if (maxCount - minCount) > 0 {
+			fScore = float64(schedulerapi.MaxPriority) * ((pm.counts[node.Name] - minCount) / (maxCount - minCount))
+		}
+		result = append(result, schedulerapi.HostPriority{Host: node.Name, Score: int(fScore)})
+		if klog.V(10) {
+			klog.Infof("%v -> %v: InterPodAffinityPriority, Score: (%d)", pod.Name, node.Name, int(fScore))
+		}
+	}
+	return result, nil
+}
+
+// ProcessTerms() 给定Pod和此Pod的定义的亲和性配置(podAffinityTerm)、被测目标pod、运行被测目标pod的Node信息，
+// 对所有潜在可被调度的Nodes列表进行一一检测,并对根据检测结果为node进行weight累计。
+func (p *podAffinityPriorityMap) processTerms(terms []v1.WeightedPodAffinityTerm, podDefiningAffinityTerm, podToCheck *v1.Pod, fixedNode *v1.Node, multiplier int) {
+	for i := range terms {
+		term := &terms[i]
+		p.processTerm(&term.PodAffinityTerm, podDefiningAffinityTerm, podToCheck, fixedNode, float64(term.Weight*int32(multiplier)))
+	}
+}
