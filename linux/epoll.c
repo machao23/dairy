@@ -200,6 +200,9 @@ static int ep_insert(struct eventpoll *ep, struct epoll_event *event,
     }
 
     /* Initialize the poll table using the queue callback */
+	// 对目标文件的监听项注册一个ep_ptable_queue_proc回调函数，
+	// ep_ptable_queue_proc回调函数将进程添加到目标文件的wakeup链表里面，并且注册ep_poll_callbak回调，
+	// 当目标文件产生事件时，ep_poll_callbak回调就去唤醒等待队列里面的进程。
     epq.epi = epi;
     init_poll_funcptr(&epq.pt, ep_ptable_queue_proc);
 
@@ -277,27 +280,6 @@ SYSCALL_DEFINE4(epoll_wait, int, epfd, struct epoll_event __user *, events,
     struct fd f;
     struct eventpoll *ep;
 
-    /* The maximum number of event must be greater than zero */
-    if (maxevents <= 0 || maxevents > EP_MAX_EVENTS)
-        return -EINVAL;
-
-    /* Verify that the area passed by the user is writeable */
-    if (!access_ok(VERIFY_WRITE, events, maxevents * sizeof(struct epoll_event)))
-        return -EFAULT;
-
-    /* Get the "struct file *" for the eventpoll file */
-    f = fdget(epfd);
-    if (!f.file)
-        return -EBADF;
-
-    /*
-     * We have to check that the file structure underneath the fd
-     * the user passed to us _is_ an eventpoll file.
-     */
-    error = -EINVAL;
-    if (!is_file_epoll(f.file))
-        goto error_fput;
-
     /*
      * At this point it is safe to assume that the "private_data" contains
      * our own data structure.
@@ -305,9 +287,267 @@ SYSCALL_DEFINE4(epoll_wait, int, epfd, struct epoll_event __user *, events,
     ep = f.file->private_data;
 
     /* Time to fish for events ... */
+	// 参数全部检查合格后，接下来就调用ep_poll函数进行真正的处理
     error = ep_poll(ep, events, maxevents, timeout);
+}
 
-error_fput:
-    fdput(f);
+// sys_epoll_wait -> ep_poll
+static int ep_poll(struct eventpoll *ep, struct epoll_event __user *events,
+           int maxevents, long timeout)
+{
+    int res = 0, eavail, timed_out = 0;
+    unsigned long flags;
+    u64 slack = 0;
+    wait_queue_t wait;
+    ktime_t expires, *to = NULL;
+	
+	// timeout大于0，说明等待timeout时间后超时
+    if (timeout > 0) {
+        struct timespec64 end_time = ep_set_mstimeout(timeout);
+
+        slack = select_estimate_accuracy(&end_time);
+        to = &expires;
+        *to = timespec64_to_ktime(end_time);
+    } else if (timeout == 0) {
+        /*
+         * Avoid the unnecessary trip to the wait queue loop, if the
+         * caller specified a non blocking operation.
+		 * 如果timeout等于0，函数不阻塞，直接返回
+         */
+        timed_out = 1;
+        spin_lock_irqsave(&ep->lock, flags);
+        goto check_events;
+    }
+	// else 小于0的情况，是永久阻塞，直到有事件产生才返回。
+
+fetch_events:
+	// 当没有事件产生时
+    if (!ep_events_available(ep))
+        ep_busy_loop(ep, timed_out);
+
+    spin_lock_irqsave(&ep->lock, flags);
+
+    if (!ep_events_available(ep)) {
+
+        /*
+         * We don't have any available event to return to the caller.
+         * We need to sleep here, and we will be wake up by
+         * ep_poll_callback() when events will become available.
+         */
+        init_waitqueue_entry(&wait, current);
+		// 将当前进程加入到ep->wq等待队列里面
+        __add_wait_queue_exclusive(&ep->wq, &wait);
+
+        for (;;) {
+            /*
+             * We don't want to sleep if the ep_poll_callback() sends us
+             * a wakeup in between. That's why we set the task state
+             * to TASK_INTERRUPTIBLE before doing the checks.
+             */
+			// 将当前进程设置为可中断的睡眠状态，然后当前进程就让出cpu，进入睡眠，
+			// 直到有其他进程调用wake_up或者有中断信号进来唤醒本进程，它才会去执行接下来的代码。
+            set_current_state(TASK_INTERRUPTIBLE);
+			
+			// 如果进程被唤醒后，首先检查是否有事件产生，或者是否出现超时还是被其他信号唤醒的。
+            if (ep_events_available(ep) || timed_out)
+                break;
+        }
+		// 如果出现这些情况，就跳出循环，将当前进程从ep->wp的等待队列里面移除，
+        __remove_wait_queue(&ep->wq, &wait);
+		// 并且将当前进程设置为TASK_RUNNING就绪状态。
+        __set_current_state(TASK_RUNNING);
+    }
+check_events:
+    /*
+     * Try to transfer events to user space. In case we get 0 events and
+     * there's still timeout left over, we go trying again in search of
+     * more luck.
+     */
+	// 如果真的有事件产生，就调用ep_send_events函数，将events事件转移到用户空间里面。
+    if (!res && eavail &&
+        !(res = ep_send_events(ep, events, maxevents)) && !timed_out)
+        goto fetch_events;
+
+    return res;
+}
+
+// sys_epoll_wait -> ep_poll -> ep_send_events -> ep_scan_ready_list:
+// ep_send_events没有什么工作，真正的工作是在ep_scan_ready_list函数里面：
+static int ep_scan_ready_list(struct eventpoll *ep,
+				  // 第二个入参是回调函数，ep_send_events传入的是 ep_send_events_proc函数
+                  int (*sproc)(struct eventpoll *,
+                       struct list_head *, void *),
+                  void *priv, int depth, bool ep_locked)
+{
+    int error, pwake = 0;
+    unsigned long flags;
+    struct epitem *epi, *nepi;
+    LIST_HEAD(txlist);
+
+    /*
+     * We need to lock this because we could be hit by
+     * eventpoll_release_file() and epoll_ctl().
+     */
+
+    if (!ep_locked)
+        mutex_lock_nested(&ep->mtx, depth);
+
+    /*
+     * Steal the ready list, and re-init the original one to the
+     * empty list. Also, set ep->ovflist to NULL so that events
+     * happening while looping w/out locks, are not lost. We cannot
+     * have the poll callback to queue directly on ep->rdllist,
+     * because we want the "sproc" callback to be able to do it
+     * in a lockless way.
+     */
+    spin_lock_irqsave(&ep->lock, flags);
+	// ep_scan_ready_list首先将ep就绪链表里面的数据链接到一个全局的txlist里面，
+    list_splice_init(&ep->rdllist, &txlist);
+	// 然后清空ep的就绪链表，同时还将ep的ovflist链表设置为NULL，
+    ep->ovflist = NULL;
+    spin_unlock_irqrestore(&ep->lock, flags);
+
+    /*
+     * Now call the callback function.
+	 * 调用sproc回调函数(这里将调用ep_send_events_proc函数)将事件数据从内核拷贝到用户空间。
+     */
+    error = (*sproc)(ep, &txlist, priv);
+
+    spin_lock_irqsave(&ep->lock, flags);
+    /*
+     * During the time we spent inside the "sproc" callback, some
+     * other events might have been queued by the poll callback.
+     * We re-insert them inside the main ready-list here.
+     */
+	// ovflist是用单链表，是一个接受就绪事件的备份链表，当执行回调函数将内核进程将事件从内核拷贝到用户空间时，
+	// 这段时间目标文件可能会产生新的事件，在回调结束后，需要重新将ovlist链表里面的事件添加到rdllist就绪事件链表里面。
+    for (nepi = ep->ovflist; (epi = nepi) != NULL;
+         nepi = epi->next, epi->next = EP_UNACTIVE_PTR) {
+        /*
+         * We need to check if the item is already in the list.
+         * During the "sproc" callback execution time, items are
+         * queued into ->ovflist but the "txlist" might already
+         * contain them, and the list_splice() below takes care of them.
+         */
+        if (!ep_is_linked(&epi->rdllink)) {
+            list_add_tail(&epi->rdllink, &ep->rdllist);
+            ep_pm_stay_awake(epi);
+        }
+    }
+    /*
+     * We need to set back ep->ovflist to EP_UNACTIVE_PTR, so that after
+     * releasing the lock, events will be queued in the normal way inside
+     * ep->rdllist.
+     */
+    ep->ovflist = EP_UNACTIVE_PTR;
+
+    /*
+     * Quickly re-inject items left on "txlist".
+     */
+    list_splice(&txlist, &ep->rdllist);
+    __pm_relax(ep->ws);
+
+    if (!list_empty(&ep->rdllist)) {
+        /*
+         * Wake up (if active) both the eventpoll wait list and
+         * the ->poll() wait list (delayed after we release the lock).
+         */
+        if (waitqueue_active(&ep->wq))
+            wake_up_locked(&ep->wq);
+        if (waitqueue_active(&ep->poll_wait))
+            pwake++;
+    }
+    spin_unlock_irqrestore(&ep->lock, flags);
+
+    if (!ep_locked)
+        mutex_unlock(&ep->mtx);
+
+    /* We have to call this outside the lock */
+    if (pwake)
+        ep_poll_safewake(&ep->poll_wait);
+
     return error;
+}
+
+// sys_epoll_wait -> ep_poll -> ep_send_events -> ep_scan_ready_list -> ep_send_events_proc:
+static int ep_send_events_proc(struct eventpoll *ep, struct list_head *head,
+                   void *priv)
+{
+    struct ep_send_events_data *esed = priv;
+    int eventcnt;
+    unsigned int revents;
+    struct epitem *epi;
+    struct epoll_event __user *uevent;
+    struct wakeup_source *ws;
+    poll_table pt;
+
+    init_poll_funcptr(&pt, NULL);
+
+    /*
+     * We can loop without lock because we are passed a task private list.
+     * Items cannot vanish during the loop because ep_scan_ready_list() is
+     * holding "mtx" during this call.
+     */
+	// 循环获取监听项的事件数据，
+    for (eventcnt = 0, uevent = esed->events;
+         !list_empty(head) && eventcnt < esed->maxevents;) {
+        epi = list_first_entry(head, struct epitem, rdllink);
+
+        /*
+         * Activate ep->ws before deactivating epi->ws to prevent
+         * triggering auto-suspend here (in case we reactive epi->ws
+         * below).
+         *
+         * This could be rearranged to delay the deactivation of epi->ws
+         * instead, but then epi->ws would temporarily be out of sync
+         * with ep_is_linked().
+         */
+        ws = ep_wakeup_source(epi);
+        if (ws) {
+            if (ws->active)
+                __pm_stay_awake(ep->ws);
+            __pm_relax(ws);
+        }
+
+        list_del_init(&epi->rdllink);
+		// 对每个监听项，调用ep_item_poll获取监听到的目标文件的事件，
+        revents = ep_item_poll(epi, &pt);
+
+        /*
+         * If the event mask intersect the caller-requested one,
+         * deliver the event to userspace. Again, ep_scan_ready_list()
+         * is holding "mtx", so no operations coming from userspace
+         * can change the item.
+         */
+		// 如果获取到事件，就调用__put_user函数将数据拷贝到用户空间。
+        if (revents) {
+            if (__put_user(revents, &uevent->events) ||
+                __put_user(epi->event.data, &uevent->data)) {
+                list_add(&epi->rdllink, head);
+                ep_pm_stay_awake(epi);
+                return eventcnt ? eventcnt : -EFAULT;
+            }
+            eventcnt++;
+            uevent++;
+            if (epi->event.events & EPOLLONESHOT)
+                epi->event.events &= EP_PRIVATE_BITS;
+            else if (!(epi->event.events & EPOLLET)) {
+                /*
+                 * If this file has been added with Level
+                 * Trigger mode, we need to insert back inside
+                 * the ready list, so that the next call to
+                 * epoll_wait() will check again the events
+                 * availability. At this point, no one can insert
+                 * into ep->rdllist besides us. The epoll_ctl()
+                 * callers are locked out by
+                 * ep_scan_ready_list() holding "mtx" and the
+                 * poll callback will queue them in ep->ovflist.
+                 */
+                list_add_tail(&epi->rdllink, &ep->rdllist);
+                ep_pm_stay_awake(epi);
+            }
+        }
+    }
+
+    return eventcnt;
 }
