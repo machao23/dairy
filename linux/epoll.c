@@ -1,3 +1,76 @@
+
+/*
+ * This structure is stored inside the "private_data" member of the file
+ * structure and represents the main data structure for the eventpoll
+ * interface.
+ */
+struct eventpoll {
+
+    /* Wait queue used by sys_epoll_wait() */
+    //这个队列里存放的是执行epoll_wait从而等待的进程队列
+    wait_queue_head_t wq;
+
+    /* Wait queue used by file->poll() */
+    //这个队列里存放的是该eventloop作为poll对象的一个实例，加入到等待的队列
+    //这是因为eventpoll本身也是一个file, 所以也会有poll操作
+    wait_queue_head_t poll_wait;
+
+    /* List of ready file descriptors */
+    //这里存放的是事件就绪的fd列表，链表的每个元素是下面的epitem
+    struct list_head rdllist;
+
+    /* RB tree root used to store monitored fd structs */
+    //这是用来快速查找fd的红黑树
+	//每当调用 epoll_ctl 增加一个 fd 时，内核就会为我们创建出一个 epitem 实例，
+	//并且把这个实例作为红黑树的一个子节点，增加到 eventpoll 结构体中的红黑树中，对应的字段是 rbr。
+	//之后查找每一个 fd 上是否有事件发生都是通过红黑树上的 epitem 来操作。
+    struct rb_root_cached rbr;
+
+    //这是eventloop对应的匿名文件，充分体现了Linux下一切皆文件的思想
+    struct file *file;
+};
+
+
+struct epitem {
+    union {
+        /* RB tree node links this structure to the eventpoll RB tree */
+        struct rb_node rbn;
+        /* Used to free the struct epitem */
+        struct rcu_head rcu;
+    };
+
+    /* List header used to link this structure to the eventpoll ready list */
+    //将这个epitem连接到eventpoll 里面的rdllist的list指针
+    struct list_head rdllink;
+
+    /*
+     * Works together "struct eventpoll"->ovflist in keeping the
+     * single linked chain of items.
+     */
+    struct epitem *next;
+
+    /* The file descriptor information this item refers to */
+    //epoll监听的fd
+    struct epoll_filefd ffd;
+
+    /* Number of active wait queue attached to poll operations */
+    //一个文件可以被多个epoll实例所监听，这里就记录了当前文件被监听的次数
+    int nwait;
+
+    /* The "container" of this item */
+    //当前epollitem所属的eventpoll
+    struct eventpoll *ep;
+
+    /* List header used to link this item to the "struct file" items list */
+    struct list_head fllink;
+
+    /* wakeup_source used when EPOLLWAKEUP is set */
+    struct wakeup_source __rcu *ws;
+
+    /* The structure that describe the interested events and the source fd */
+    struct epoll_event event;
+};
+
 // epoll_create用于创建一个epoll的句柄，其在内核的系统实现如下
 SYSCALL_DEFINE1(epoll_create, int, size)
 {
