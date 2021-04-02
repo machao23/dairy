@@ -62,6 +62,14 @@ public abstract class MultithreadEventExecutorGroup extends AbstractEventExecuto
         Collections.addAll(childrenSet, children);
         readonlyChildren = Collections.unmodifiableSet(childrenSet);
     }
+	
+	// 把这个channel注册到组内里某个eventloop里处理
+	// 在connect里会被调用（后续所有的IO应该都在这一个EventLoop里处理了吗？但是响应回调没法保证是同一个的吧？）
+	// 所以这个EventLoopGroup就是一个EventLoop池。每个EventLoop处理多个Channel
+	@Override
+    public ChannelFuture register(Channel channel) {
+        return next().register(channel);
+    }
 }
 
 public final class DefaultEventExecutorChooserFactory implements EventExecutorChooserFactory {

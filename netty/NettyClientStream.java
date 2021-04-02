@@ -251,7 +251,8 @@ public final class ChannelOutboundBuffer {
 public abstract class AbstractNioByteChannel extends AbstractNioChannel {
     // 父类的构造函数,parent是null
     protected AbstractNioByteChannel(Channel parent, SelectableChannel ch) {
-	super(parent, ch, SelectionKey.OP_READ);
+		// 建立客户端channel后面会关注OP_READ事件
+		super(parent, ch, SelectionKey.OP_READ);
     }
 
      // 上一个super的实现

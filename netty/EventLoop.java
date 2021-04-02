@@ -166,8 +166,21 @@ public abstract class SingleThreadEventExecutor extends AbstractScheduledEventEx
     public void execute(Runnable task) {
         boolean inEventLoop = inEventLoop();
         addTask(task);
+		// 当前线程不是这个线程池里
         if (!inEventLoop) {
+			// 创建一个EventLoop线程
             startThread();
         }
     }
+	
+	// 被startThread调用
+	private void doStartThread() {
+        executor.execute(new Runnable() {
+            @Override
+            public void run() {
+				// 创建并运行一个EventLoop线程
+				SingleThreadEventExecutor.this.run();
+			}
+		}
+	}
 }

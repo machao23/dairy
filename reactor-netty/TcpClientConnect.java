@@ -217,4 +217,21 @@ final class HttpClientConnect extends HttpClient {
 			}
 		}
 	}
+	
+	// 观察连接的状态变化
+	final static class HttpIOHandlerObserver implements ConnectionObserver {
+		@Override
+		public void onStateChange(Connection connection, State newState) {
+			// 连接状态更新成CONFIGURED后表示该连接已经Active，可以发请求了
+			if (newState == ConnectionObserver.State.CONFIGURED
+					&& HttpClientOperations.class == connection.getClass()) {
+				if (log.isDebugEnabled()) {
+					log.debug(format(connection.channel(), "Handler is being applied: {}"), handler);
+				}
+
+				Mono.defer(() -> Mono.fromDirect(handler.requestWithBody((HttpClientOperations) connection)))
+				    .subscribe(connection.disposeSubscriber());
+			}
+		}
+	}
 }

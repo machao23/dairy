@@ -1,7 +1,9 @@
 import reactor.util.annotation.Nullable;
 
+// 调用Mono.create (sink -> {...}) 时候会创建一个Mono.create
 final class MonoCreate<T> extends Mono<T> implements SourceProducer<T> {
 
+	// subscribe方法是在第一阶段构建流式链表调用的
 	@Override
 	public void subscribe(CoreSubscriber<? super T> actual) {
 		//1. 创建MonoSink实例，供MonoCreate来使用
