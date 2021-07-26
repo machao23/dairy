@@ -118,7 +118,7 @@ static final class MapFuseableSubscriber<T, R> implements InnerOperator<T, R>, Q
 	}
 
 	//当下游支持融合时，下游会调用poll方法主动拉取上游的数据
-	//第4步：异步融合收到onNext方法的通知时，才会调用poll （所以异步融合和同步相比，多了一次onNext，最后融合都会走到poll？）
+	//第4步：异步融合收到onNext方法的通知时，才会调用poll （所以异步融合和同步相比，多了一次onNext，最后融合都会走到poll？ ）
 	//同步融合时，再调用完requestFusion方法后得到上游支持同步融合时便可直接poll数据
 	public R poll() {
 	  for(;;) {
