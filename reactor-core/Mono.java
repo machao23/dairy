@@ -156,9 +156,219 @@ static final class MapFuseableSubscriber<T, R> implements InnerOperator<T, R>, Q
 		//异常往下游流动
 		actual.onError(t);
 	}
-	//onComplete方法跟onError类似，省略
+}
 
-	//省略若干代码
+public abstract class Mono<T> implements CorePublisher<T> {
+	public final <R> Mono<R> flatMap(Function<? super T, ? extends Mono<? extends R>>
+			transformer) {
+		return onAssembly(new MonoFlatMap<>(this, transformer));
+	}
+}
+
+//很明显MonoFlatMap也是支持融合的
+final class MonoFlatMap<T, R> extends InternalMonoOperator<T, R> implements Fuseable {
+
+	public CoreSubscriber<? super T> subscribe(CoreSubscriber<? super R> actual) {
+		FlatMapMain<T, R> manager = new FlatMapMain<>(actual, mapper);
+		
+		//先把QueueSubscription往下游传，可以request请求到FlatMapMain
+		//然后source#onSubscribe传下来Subscription，已经明确需要拉取的数据量大小了，也算是一个优化点
+		actual.onSubscribe(manager);
+
+		//返回Subscriber继续while循环订阅，直到数据源头
+		return manager;
+	}
+
+	//FlatMapMain既是QueueSubscription 需要处理下游请求的request，cancel方法，
+	//又是Subscriber 需要处理上游传下来的onSubscribe，onNext方法等
+	static final class FlatMapMain<T, R> extends Operators.MonoSubscriber<T, R> {
+
+		final Function<? super T, ? extends Mono<? extends R>> mapper;
+		final FlatMapInner<R> second; //新数据源的subscriber（下游？）
+		boolean done;
+		volatile Subscription s; //（上游？)
+
+		//第1步：
+		@Override
+		public void onSubscribe(Subscription s) {
+			if (Operators.setOnce(S, this, s)) {
+				//很明显flatMap没有向上传请求融合
+				//所以数据会从onNext方法从上游传下来
+				s.request(Long.MAX_VALUE);
+			}
+		}
+
+		//第2步：上游发射数据到onNext方法，
+		//调用mapper方法产生新数据源并订阅
+		@Override
+		public void onNext(T t) {
+			if (done) {
+				Operators.onNextDropped(t, actual.currentContext());
+				return;
+			}
+			//因为是Mono只发送1个元素，所以onNext处理完，上游就结束了。
+			//至于下游的onComplete方法会在flatMap产生新数据源中触发
+			done = true;
+
+			Mono<? extends R> m;
+
+			try {
+				//flatMap创建一个新的Publisher，这里返回的还只是Mono.create，还没到异步返回结果回调阶段
+				m = Objects.requireNonNull(mapper.apply(t),
+						"The mapper returned a null Mono");
+			}
+			catch (Throwable ex) {
+				actual.onError(Operators.onOperatorError(s, ex, t,
+						actual.currentContext()));
+				return;
+			}
+
+			try {
+				//原来下游seconde订阅flatMap逻辑定义返回的新publisher，即触发了创建回调函数future.addListener
+				m.subscribe(second);
+			}
+			catch (Throwable e) {
+				actual.onError(Operators.onOperatorError(this, e, t,
+						actual.currentContext()));
+			}
+		}
+
+		//--------------------------
+		//下游在onSubscribe方法收到上游的QueueSubscription时，可能执行融合操作
+
+		//第3步：下游请求融合，返回支持异步融合
+		@Override
+		public int requestFusion(int mode) {
+			//因为新数据源何时能发射是未知的，所以是异步融合
+			if ((mode & ASYNC) != 0) {
+				STATE.lazySet(this, FUSED_EMPTY); //设置融合标志位
+				return ASYNC;
+			}
+			//only async
+			return NONE;
+		}
+
+		//第4步：不管是异步融合还是不支持融合时，都需要调用request方法
+		public void request(long n) {
+		    if (validate(n)) {
+			    for (; ; ) {
+			       int s = state;
+  			    
+			        //标记位已经被处理过，直接return
+			        //处理过定义：已经请求该request方法，融合过，cancel过，
+			        if ((s & ~NO_REQUEST_HAS_VALUE) != 0) {
+				        return;
+			        }
+  			    
+			        //上游已经发射值了，但未request
+			        //所以直接往下游发射数据即可
+			        if (s == NO_REQUEST_HAS_VALUE && STATE.compareAndSet(this, NO_REQUEST_HAS_VALUE, HAS_REQUEST_HAS_VALUE)) {
+				        O v = value;
+				        if (v != null) {
+					        value = null;
+					        Subscriber<? super O> a = actual;
+					        a.onNext(v);
+					        a.onComplete();
+				        }
+				        return;
+			        }
+  			    
+			        //设置请求过的标志位
+			        if (STATE.compareAndSet(this, NO_REQUEST_NO_VALUE, HAS_REQUEST_NO_VALUE)) {
+				      return;
+				    }
+			    }//for end
+  		    } //if end
+		}
+
+		//第5步：新数据源发射数据时，最终会调用该方法
+		public final void complete(O v) {
+		    for (; ; ) {
+			  int state = this.state;
+			  if (state == FUSED_EMPTY) {  //下游调用了requestFusion方法，进行异步融合
+				  setValue(v);
+				  
+				  //只标志位为融合准备完成,调用下游的onNext方法通知，
+				  //并调用onComplete方法通知下游数据已发射完
+				  if (STATE.compareAndSet(this, FUSED_EMPTY, FUSED_READY)) {
+					  Subscriber<? super O> a = actual;
+					  a.onNext(v);
+					  a.onComplete();
+					  return;
+				  }
+				  //refresh state if race occurred so we test if cancelled in the next comparison
+				  state = this.state;
+			  }
+			  
+			  //下面是对未进行融合的处理    
+			  //已经设置过了，执行丢弃value hook，并return
+			  if ((state & ~HAS_REQUEST_NO_VALUE) != 0) {
+				  discard(v);
+				  return;
+			  }
+			  
+			  //下游已执行过request，那么直接往下游继续发射数据
+			  if (state == HAS_REQUEST_NO_VALUE && STATE.compareAndSet(this, HAS_REQUEST_NO_VALUE, HAS_REQUEST_HAS_VALUE)) {
+				  this.value = null;
+				  Subscriber<? super O> a = actual;
+				  a.onNext(v);
+				  a.onComplete();
+				  return;
+			  }
+			  
+			  //未执行过request，保存value并设置有值标志位
+			  setValue(v);
+			  if (state == NO_REQUEST_NO_VALUE && STATE.compareAndSet(this, NO_REQUEST_NO_VALUE, NO_REQUEST_HAS_VALUE)) {
+				  return;
+			  }
+		    }
+		}
+
+		//第6步：下游请求异步融合时，收到上面complete方法（第一个if分支）中发射发出的通知。
+		//注意此时下游的onNext不再是数据了，而是通知。下游调用上游的QueueSubscription#poll方法拉取数据
+		public final O poll() {
+			if (STATE.compareAndSet(this, FUSED_READY, FUSED_CONSUMED)) { //异步融合消费完成
+				O v = value;
+				value = null;
+				return v;
+			}
+			return null;
+		}
+
+		//省略若干代码
+	}
+
+	//还有一个分支，对新数据源的订阅处理
+	//即上面onNext方法内 m.subscribe(second)，这个second
+
+	static final class FlatMapInner<R> implements InnerConsumer<R> {
+
+		final FlatMapMain<?, R> parent;
+
+		volatile Subscription s;
+
+		//这个subscriber也不会做请求融合处理
+		public void onSubscribe(Subscription s) {
+			if (Operators.setOnce(S, this, s)) {
+				//直接拉满
+				s.request(Long.MAX_VALUE);
+			}
+		}
+
+		//最终还是调到上面分析的FlatMapMain#complete方法
+		@Override
+		public void onNext(R t) {
+			if (done) {
+				Operators.onNextDropped(t, parent.currentContext());
+				return;
+			}
+			done = true;
+			//接连上面的第5步
+			this.parent.complete(t);
+		}
+
+		//省略若干代码
+	}
 }
 
 
