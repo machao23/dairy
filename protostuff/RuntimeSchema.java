@@ -16,7 +16,7 @@ public final class RuntimeSchema<T> extends MappedSchema<T> {
     }
 }
 
-// 通过Unsafe方式实例化
+// 通过Unsafe方式获取类字段
 public final class RuntimeUnsafeFieldFactory {
 	public static final RuntimeFieldFactory<String> STRING = new RuntimeFieldFactory<String>(ID_STRING)
     {
@@ -49,6 +49,7 @@ public final class RuntimeUnsafeFieldFactory {
     };
 }
 
+// 以protobuf格式输出字符串
 public final class ProtostuffOutput extends WriteSession implements Output {
 	// 使用PB方式序列化string类型字段值
 	public void writeString(int fieldNumber, String value, boolean repeated) throws IOException
@@ -57,6 +58,7 @@ public final class ProtostuffOutput extends WriteSession implements Output {
                 value, 
                 this, 
                 sink.writeVarInt32(
+						// protobuf每个field的id是由fieldNumber和wire type组装的
                         makeTag(fieldNumber, WIRETYPE_LENGTH_DELIMITED), 
                         this, 
                         tail));
