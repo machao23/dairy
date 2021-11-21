@@ -226,3 +226,85 @@ final class FluxPublishOn<T> extends FluxOperator<T, T> implements Fuseable {
 		}
 	}
 }
+
+static final class ParallelSourceMain<T> implements InnerConsumer<T> {
+	// 并行，一般CPU个数的下游订阅者
+	final CoreSubscriber<? super T>[] subscribers;
+	// 上游所有的请求元素，是原子数组
+	final AtomicLongArray requests;
+	
+	@Override
+	public void onSubscribe(Subscription s) {
+		sourceMode = m;
+		queue = qs;
+		done = true;
+		setupSubscribers();
+		// 消费上游publisher放在队列里的数据
+		drain();
+		return;
+	}		
+	
+	// 实际消费数据的方法，drain会调用到这里
+	void drainSync() {
+		int missed = 1;
+		
+		Queue<T> q = queue;
+		CoreSubscriber<? super T>[] a = this.subscribers;
+		AtomicLongArray r = this.requests;
+		long[] e = this.emissions;
+		int n = e.length;
+		int idx = index;
+		
+		for (;;) {
+
+			int notReady = 0;
+			
+			for (;;) {
+				if (q.isEmpty()) {
+					for (Subscriber<? super T> s : a) {
+						s.onComplete();
+					}
+					return;
+				}
+				
+				// r和e分别是最大请求数和实际请求数
+				long ridx = r.get(idx);
+				long eidx = e[idx];
+				if (ridx != eidx) {
+
+					T v;
+					v = q.poll();
+					if (v == null) {
+						for (Subscriber<? super T> s : a) {
+							s.onComplete();
+						}
+						return;
+					}
+					// 传递给并发下游的订阅者之一
+					a[idx].onNext(v);
+					
+					e[idx] = eidx + 1;
+					notReady = 0;
+				} else {
+					notReady++;
+				}
+				// 轮询
+				idx++;
+				if (idx == n) {
+					idx = 0;
+				}
+			}
+			
+			int w = wip;
+			if (w == missed) {
+				index = idx;
+				missed = WIP.addAndGet(this, -missed);
+				if (missed == 0) {
+					break;
+				}
+			} else {
+				missed = w;
+			}
+		}
+	}
+}
