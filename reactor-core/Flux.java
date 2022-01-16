@@ -308,3 +308,8 @@ static final class ParallelSourceMain<T> implements InnerConsumer<T> {
 		}
 	}
 }
+
+final class FluxFlatMap<T, R> extends FluxOperator<T, R> {
+	static final class FlatMapInner<R> implements InnerConsumer<R>, Subscription {
+	}
+}
