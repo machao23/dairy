@@ -73,7 +73,7 @@ int dictRehash(dict *d, int n) {
         while(d->ht[0].table[d->rehashidx] == NULL) {
 			// 跳过空的bucket
             d->rehashidx++;
-			// empty_visits表示已经检查过的空bucket，避免连续空bucket太多导致阻塞主线程
+			// empty_visits表示已经检查过的空bucket，避免空bucket太多导致阻塞主线程
             if (--empty_visits == 0) return 1;
         }
         de = d->ht[0].table[d->rehashidx];
@@ -84,6 +84,7 @@ int dictRehash(dict *d, int n) {
 
             nextde = de->next;
             /* Get the index in the new hash table */
+			// 计算在扩容后新的hash表里的hash值
             h = dictHashKey(d, de->key) & d->ht[1].sizemask;
             de->next = d->ht[1].table[h];
             d->ht[1].table[h] = de;
