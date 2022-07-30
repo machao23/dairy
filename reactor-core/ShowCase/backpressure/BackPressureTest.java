@@ -123,4 +123,28 @@ public class BackPressureTest {
                 .subscribe();
     }
 
+	@Test
+    public void testCompose() {
+        AtomicInteger ai = new AtomicInteger();
+        Function<Flux<String>, Flux<String>> filterAndMap = f -> {
+            System.out.println("ai:" + ai.get());
+            if (ai.incrementAndGet() == 1) {
+                return f.filter(color -> !color.equals("orange"))
+                        .map(String::toUpperCase);
+            }
+            return f.filter(color -> !color.equals("purple"))
+                    .map(String::toUpperCase);
+        };
+        Flux<String> composedFlux =
+                Flux.fromIterable(Arrays.asList("blue", "green", "orange", "purple"))
+                        .doOnNext(System.out::println)
+                        //为每个subscriber 生成一个新的original sequence
+                        //original sequence的内容为compose()前面部分
+                        // transform是初始化时候执行的，compose是在每次subscribe时候重新执行一遍
+                        // compose后续版本又叫DeferTransform，即在subscribe阶段执行
+                        .compose(filterAndMap);
+
+        composedFlux.subscribe(d -> System.out.println("Subscriber 1 to Composed MapAndFilter :" + d));
+        composedFlux.subscribe(d -> System.out.println("Subscriber 2 to Composed MapAndFilter: " + d));
+    }
 }
